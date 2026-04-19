@@ -1,0 +1,1033 @@
+% ============================================================
+%  Technical Report: Synthetic QA Dataset Generation
+%  via Graph-Grounded Multi-Step Reasoning
+% ============================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\geometry{margin=1in}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black}
+
+\lstdefinestyle{py}{
+    language=Python, basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}, commentstyle=\color{gray},
+    stringstyle=\color{orange!70!black},
+    breaklines=true, frame=single, rulecolor=\color{gray!40},
+    backgroundcolor=\color{gray!5}, numbers=left,
+    numberstyle=\tiny\color{gray}, numbersep=5pt,
+}
+
+\title{\textbf{Synthetic QA Dataset Generation\\
+via Graph-Grounded Multi-Step Reasoning}\\[0.4em]
+\large Implementation, Design Rationale, and Extension Guide}
+\author{Technical Implementation Report}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Pipeline Overview}
+
+\subsection{Core Idea}
+
+Rather than prompting an LLM to generate hard questions directly (which produces unverifiable claims), the pipeline grounds every question in externally retrieved facts stored in a knowledge graph. Every node in the graph is a single atomic fact traceable to one tool call. Questions are written by sampling a subgraph and asking the LLM to connect its nodes — so the answer is verifiable against the graph, which is in turn verifiable against the retrieved sources. Topological properties of the sampled subgraph (diameter, cross-cluster span) directly control question complexity. The LLM's job is to navigate the graph and synthesize questions from it, not to invent facts.
+
+\subsection{Stage-by-Stage Description}
+
+\paragraph{Knowledge graph construction (Section~\ref{sec:kg}, \ref{sec:kgds}).}
+The KG is built once from a list of seed topics and reused across all generation runs. For each seed, three tools are called: \texttt{search} (triggers a full search→page-visit chain), \texttt{wikipedia}, and \texttt{scholar}. Each tool result is atomised by an LLM into the smallest possible independent facts, each stored as a typed node (\texttt{Entity}) with \texttt{tool\_source} and \texttt{tool\_query} fields. Facts from the same lookup are connected with \texttt{same\_topic} edges; facts from different lookups within the same round are cross-linked by an LLM that identifies typed semantic relations (supports, causes, elaborates, etc.). After all seeds are processed, a second cross-topic pass links representative nodes from \emph{different} seed topics --- without this, each seed forms an isolated clique and cross-domain questions are impossible. With 14 seeds, this produces 205 entity nodes and 1,106 relations in a single connected component.
+
+\paragraph{Tool ecosystem (Section~\ref{sec:tools}).}
+All tools implement \texttt{BaseTool} (\texttt{async execute(**kwargs) → dict}) and are registered with \texttt{ToolRegistry}. The registry dispatches tool calls from ReAct agents by name (\texttt{TOOL\_CALL: tool\_name | query}), normalising the generic \texttt{query} string into tool-specific kwargs. Two tool categories exist: \emph{retrieval tools} (\texttt{search}, \texttt{visit}, \texttt{wikipedia}, \texttt{scholar}, \texttt{table}) used during KG construction; \emph{computation/reasoning tools} (\texttt{calculator}, \texttt{python}, \texttt{unit\_converter}, \texttt{timeline}, \texttt{comparison}) reserved for the QC advanced solver. Adding a new tool requires only subclassing \texttt{BaseTool} and calling \texttt{registry.register()}.
+
+\paragraph{Subgraph sampling (Section~\ref{sec:sampling}).}
+A \texttt{SubgraphSampler} extracts a connected subset of the KG to serve as the knowledge context for one QA pair. Two strategies alternate per batch: \emph{random walk} (starts from a random node, walks \texttt{walk\_length} undirected steps, deduplicates) and \emph{bridging} (picks \texttt{n\_components} random seed nodes from different graph regions, collects their 2-hop neighborhoods, stitches them together). Random walk produces locally clustered subgraphs; bridging forces cross-domain span. If the induced subgraph is disconnected, \texttt{\_ensure\_connected} inserts shortest-path intermediate nodes to guarantee connectivity. \texttt{walk\_length} is the primary dial for subgraph diameter; \texttt{n\_components} is the primary dial for cross-domain span. Both are scaled by \texttt{--complexity}.
+
+\paragraph{QA generation (Section~\ref{sec:qagen}).}
+Given a subgraph, the LLM receives a formatted description of all its entities (with values and tool sources) and all relations between them. The prompt (\texttt{prompts/graph\_qa\_generator.txt}) requires the output question to connect at least 3 entities and have a definitive verifiable answer that cannot be inferred from any single entity alone. Output: \texttt{QAPair} with \texttt{source\_chunk\_ids} pointing to the entity IDs used.
+
+\paragraph{Uncertainty injection (Section~\ref{sec:uncertainty}).}
+Before escalation, one (configurable: up to six) atomic reframing operation is applied to the question \emph{within the existing subgraph} — no new entities are added. Operations: entity anonymisation, temporal constraint addition, attribute substitution, condition injection, aggregation requirement, indirection. Each operation is a single LLM call that modifies the question and updates the answer accordingly. Sequential composition: each operation's output is the next operation's input.
+
+\paragraph{Graph escalation (Section~\ref{sec:escalation}).}
+The question is rewritten to span additional KG nodes beyond the original subgraph. The escalator finds 1-hop neighbor entities not already in the subgraph (sorted by degree, capped at 12 candidates), then runs a ReAct loop: the LLM sees the current Q/A, the covered entities, the candidate entities, and the tool list. It may call tools to verify candidate facts, then emits a JSON response with the rewritten question, new answer, and which candidate entities it incorporated. The entity IDs are merged into \texttt{source\_chunk\_ids} with connector nodes to maintain connectivity. Five strategies (\texttt{hop\_extension}, \texttt{subgraph\_bridging}, \texttt{multi\_entity\_aggregation}, \texttt{constraint\_chain}, \texttt{inverse\_reasoning}) are described in the escalation prompt; the LLM selects which to apply. Strategy weights shift toward bridging/aggregation at high complexity values.
+
+\paragraph{Quality control (Section~\ref{sec:qc}).}
+Three sequential filters: (1)~\emph{base solver} (LLM, no tools) — if it answers correctly, the question is \texttt{TOO\_EASY}; (2)~\emph{advanced solver} (LLM, full tool access, ReAct loop up to $8+4c$ calls) — if it fails, \texttt{TOO\_HARD}; (3)~\emph{semantic deduplication} (cosine similarity of sentence-transformer embeddings, threshold 0.85) — if too similar to a prior PASS, \texttt{DUPLICATE}. Base solver is always judged strictly. Advanced solver is judged with complexity-aware leniency: \texttt{lenient\_paraphrase} at low cx (small subgraphs produce phrasing-divergent answers), \texttt{strict} at mid cx, \texttt{lenient\_partial} at high cx (multi-hop answers may be incomplete but core claim correct).
+
+\paragraph{Trajectory capture (Section~\ref{sec:trajectory}).}
+For every PASS, the advanced solver's full ReAct chain (thought → tool\_call → observation → \ldots → answer) is recorded as a \texttt{Trajectory} and saved to \texttt{passing\_trajectories.jsonl}. This is the training signal for fine-tuning tool-augmented reasoning models.
+
+\paragraph{Complexity control (Section~\ref{sec:complexity}).}
+\texttt{--complexity} $c \in [0,1]$ linearly scales sampling parameters: \texttt{walk\_length} $10 \to 30$, \texttt{bridge\_components} $2 \to 4$, \texttt{walk\_min/max}, solver tool budget. It does not post-filter; it controls the generative process so that every generated question is at the target difficulty. Omitting the flag runs the original fixed pipeline.
+
+\subsection{Quick Start}
+
+\begin{lstlisting}[style=py, language=bash]
+pip install openai anthropic sentence-transformers networkx pydantic pyyaml \
+            beautifulsoup4 aiohttp requests duckduckgo-search
+
+source configs/env.sh   # sets OPENAI_API_KEY, SEMANTIC_SCHOLAR_API_KEY
+
+# Build the KG once (~30 min, GPT-4o)
+python scripts/rebuild_kg.py
+
+# Generate QA pairs
+python scripts/generate_until_pass.py --batches 5 --batch-size 8
+python scripts/generate_until_pass.py --complexity 0.7 --batches 5 --batch-size 8
+
+# Visualiser (optional)
+python ui/serve.py   # -> http://localhost:8765/ui/viewer.html
+\end{lstlisting}
+
+\subsection{Key File Locations}
+
+\begin{tabular}{ll}
+\toprule
+\textbf{Path} & \textbf{Purpose} \\
+\midrule
+\texttt{scripts/generate\_until\_pass.py} & Main generation loop \\
+\texttt{scripts/rebuild\_kg.py} / \texttt{expand\_kg.py} & KG build / incremental expansion \\
+\texttt{src/graph/graph\_builder.py} & KG construction, cross-topic edges \\
+\texttt{src/graph/subgraph\_sampler.py} & Random walk + bridging sampling \\
+\texttt{src/graph/uncertainty\_injector.py} & Atomic question reframings \\
+\texttt{src/pipeline/stage2\_graph\_escalation.py} & ReAct escalation, 5 strategies \\
+\texttt{src/pipeline/stage3\_quality\_control.py} & Solver + judge + dedup \\
+\texttt{src/agents/judge\_agent.py} & Complexity-aware judge \\
+\texttt{src/tools/tool\_registry.py} & \texttt{BaseTool} interface + dispatch \\
+\texttt{src/utils/llm\_client.py} & Async LLM client (OpenAI/Anthropic) \\
+\texttt{src/utils/data\_models.py} & All Pydantic schemas \\
+\texttt{configs/llm\_config.yaml} & Model, temperature, token budgets per agent \\
+\texttt{configs/tool\_config.yaml} & Tool API keys and parameters \\
+\texttt{prompts/*.txt} & All LLM prompts (Python \texttt{.format()} substitution) \\
+\texttt{data/output/knowledge\_graph.json} & Serialised KG \\
+\texttt{data/output/passing\_qas.jsonl} & Final QA pairs (appended across runs) \\
+\texttt{data/output/passing\_trajectories.jsonl} & Solver ReAct chains for every PASS \\
+\bottomrule
+\end{tabular}
+
+% ============================================================
+\section{Source Papers and Scope}
+
+This is a reconstruction of two Alibaba/Tongyi Lab pipelines:
+
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item \textbf{Track A} — WebFrontier (Qiao et al., arXiv:2509.13309v2): corpus-anchored seed QA pairs iteratively escalated by a tool-augmented ReAct agent.
+  \item \textbf{Track B} — Tongyi DeepResearch (arXiv:2510.24701v2): entity-anchored knowledge graph, subgraph sampling for question generation, uncertainty injection, graph escalation.
+\end{itemize}
+
+Track B is the primary implementation ($\sim$4,500 lines, fully functional). Track A is implemented in \texttt{scripts/run\_track\_a.py} but less tested. All analysis below is Track B unless specified.
+
+% ============================================================
+\section{Architecture and Data Flow}
+\label{sec:arch}
+
+\begin{lstlisting}[style=py, caption=Track B pipeline (generate\_until\_pass.py)]
+# One batch:
+# 1. Sample 2*batch_size subgraphs in parallel (Semaphore=8)
+#    - odd idx:  sample_bridging(n_components, per_comp)
+#    - even idx: sample_by_random_walk(walk_min, walk_max, walk_length)
+#    take first batch_size successes
+# 2. Uncertainty injection: asyncio.gather all QAs
+# 3. Graph escalation: escalate_batch(rounds, max_concurrent=6)
+# 4. QC: run_qc_batch(max_concurrent=6)
+#    - base_solver.solve_base -> judge(strict)  => TOO_EASY
+#    - advanced_solver.solve_advanced -> judge(cx-aware) => TOO_HARD
+#    - similarity_scorer.is_duplicate(0.85) => DUPLICATE
+#    - else: PASS -> append to passing_qas.jsonl + ui_data.json
+\end{lstlisting}
+
+\textbf{KG is built once.} It requires $\sim$30--60 min with GPT-4o for 14 seeds. All downstream stages load from \texttt{data/output/knowledge\_graph.json}. Rebuilding invalidates all QA checkpoints.
+
+\textbf{Checkpointing.} The orchestrator (\texttt{src/pipeline/orchestrator.py}) saves each stage as JSONL to \texttt{data/checkpoints/\{stage\}.jsonl}. Stage result is loaded from checkpoint if file exists, skipping the stage. To re-run a stage, delete its checkpoint file.
+
+% ============================================================
+\section{Data Models}
+\label{sec:models}
+
+All inter-stage data is Pydantic v2 (\texttt{src/utils/data\_models.py}). Models are serialised via \texttt{model\_dump()} / \texttt{model\_validate\_json()}.
+
+\begin{lstlisting}[style=py, caption=Core data models]
+class Entity(BaseModel):
+    id: str          # uuid4[:8], generated on construction
+    name: str        # short label (< 10 words)
+    entity_type: str # fact|quantity|date|definition|person|place|event
+    attributes: dict # {"value": <fact sentence>, "key_terms": [...]}
+    tool_source: str # which tool produced this node
+    tool_query: str  # exact query sent to the tool
+    snippet: str     # raw text from tool result
+
+class Relation(BaseModel):
+    source_id: str
+    target_id: str
+    relation_type: str  # supports|elaborates|quantifies|causes|
+                        # contradicts|temporal|same_topic
+    evidence: str = ""
+
+class QAPair(BaseModel):
+    id: str
+    question: str
+    answer: str
+    difficulty: QADifficulty     # seed|escalated_1|2|3|final
+    source_chunk_ids: list[str]  # KG entity IDs in this QA's subgraph
+    source_subgraph_id: str
+    escalation_history: list[str]# question text at each prior escalation step
+    required_tools: list[ToolType]
+    metadata: dict               # strategy, complexity_level, entities_incorporated
+
+class TrajectoryStep(BaseModel):
+    role: str            # "assistant" (thought/tool_call) | "user" (observation)
+    content: str
+    tool: Optional[str]
+    tool_query: Optional[str]
+    observation: Optional[str]
+
+class Trajectory(BaseModel):
+    qa_id: str
+    mode: str = "react"  # "react" | "escalation"
+    steps: list[TrajectoryStep]
+    final_answer: str
+    tool_calls_used: list[str]
+    created_at: str
+\end{lstlisting}
+
+\textbf{Why \texttt{source\_chunk\_ids} instead of embedding the subgraph?} IDs are cheap to store and sufficient to reconstruct the full subgraph description from the KG at any point. Embedding the full subgraph text in every QAPair would bloat JSONL by $10\times$.
+
+\textbf{Why \texttt{escalation\_history} as a list of strings?} The history stores only the question text, not the full QAPair. This is sufficient for the UI's escalation chain view and for analysing how questions evolved, without the memory cost of recursive object nesting.
+
+% ============================================================
+\section{LLM Client}
+\label{sec:llm}
+
+\textbf{File:} \texttt{src/utils/llm\_client.py}
+
+\subsection{Design}
+
+\texttt{LLMClient} is a thin async wrapper over OpenAI and Anthropic SDKs with:
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item Provider dispatch via \texttt{\_call\_provider(provider, model, messages, params)}
+  \item Per-agent call params loaded from \texttt{configs/llm\_config.yaml} by \texttt{params\_key}
+  \item Exponential backoff retry: 3 retries at delays $[2, 4, 8]$ seconds
+  \item JSON extraction via \texttt{complete\_json(messages, schema: type[BaseModel])}
+\end{itemize}
+
+\subsection{JSON Parsing (\texttt{\_parse\_json\_response})}
+
+Three-pass extraction strategy, tried in order:
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item \texttt{schema.model\_validate\_json(raw)} — direct parse
+  \item Regex extract from markdown code block: \verb|```(?:json)?\s*\n?(.*?)\n?\s*```|
+  \item Regex extract first JSON object: \verb|\{.*\}| (DOTALL)
+\end{enumerate}
+
+\textbf{Why regex instead of guided decoding?} The pipeline targets OpenAI-compatible APIs where structured output (\texttt{response\_format}) is available but not used. Regex is provider-agnostic and works with any OpenAI-compatible endpoint (including local vLLM). The failure rate for well-formed models (GPT-4o) is $<$1\%. For local models that emit think-tokens (e.g.\ Qwen3), the regex will fail on \texttt{<think>...</think>} blocks --- fix by stripping think blocks before the three-pass extraction.
+
+\subsection{Adding a Provider}
+
+Add to \texttt{\_init\_clients}:
+\begin{lstlisting}[style=py]
+if "myprovider" in providers:
+    from myprovider_sdk import AsyncClient
+    self._clients["myprovider"] = AsyncClient(
+        api_key=providers["myprovider"]["api_key"]
+    )
+\end{lstlisting}
+
+Add to \texttt{\_call\_provider}:
+\begin{lstlisting}[style=py]
+elif provider == "myprovider":
+    return await self._call_myprovider(model, messages, params)
+\end{lstlisting}
+
+Add \texttt{\_call\_myprovider} following the same pattern as \texttt{\_call\_openai}: extract system messages, call API, return \texttt{str}. Then set \texttt{default\_provider: myprovider} in \texttt{configs/llm\_config.yaml}.
+
+\subsection{Switching to a Local Model}
+
+In \texttt{configs/llm\_config.yaml}:
+\begin{lstlisting}[style=py, language=yaml]
+providers:
+  openai:
+    api_key: "unused"
+    base_url: "http://localhost:8000/v1"  # vLLM endpoint
+    default_model: "Qwen3-30B-A3B"
+\end{lstlisting}
+
+The \texttt{openai.AsyncOpenAI} client respects \texttt{base\_url}. No other code changes required. Two known local-model issues:
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item Qwen3 emits \texttt{<think>...</think>} blocks that break \texttt{\_parse\_json\_response}. Fix: strip with \verb|re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)| before the three-pass extraction.
+  \item Long prompts ($>$30k tokens in graph escalation) cause structured extraction failures. Fix: add \texttt{response\_format=\{"type": "json\_schema", "json\_schema": ...\}} to vLLM calls (guided decoding).
+\end{enumerate}
+
+% ============================================================
+\section{Tool Ecosystem}
+\label{sec:tools}
+
+\subsection{Interface}
+
+Every tool extends \texttt{BaseTool} (\texttt{src/tools/tool\_registry.py}):
+
+\begin{lstlisting}[style=py]
+class BaseTool(ABC):
+    name: str         # string key used in TOOL_CALL directives
+    description: str  # shown to LLM in prompt via get_descriptions_for_prompt()
+
+    @abstractmethod
+    async def execute(self, **kwargs: Any) -> dict:
+        # Must return {"result": <any>, "cached": bool, ...}
+        ...
+\end{lstlisting}
+
+\subsection{Registry and Dispatch}
+
+\texttt{ToolRegistry} holds \texttt{\_tools: dict[str, BaseTool]}. Registration:
+\begin{lstlisting}[style=py]
+registry.register(MyTool(config))
+\end{lstlisting}
+
+Dispatch normalises a generic \texttt{query} kwarg into tool-specific params before calling \texttt{tool.execute(**kwargs)}:
+\begin{lstlisting}[style=py]
+# In ToolRegistry.execute():
+if "query" in kwargs:
+    q = kwargs["query"]
+    if tool_name == "python" and "code" not in kwargs:
+        kwargs["code"] = q
+    elif tool_name == "visit" and "url" not in kwargs:
+        if "|" in q:
+            url, goal = q.split("|", 1)
+            kwargs["url"] = url.strip(); kwargs["goal"] = goal.strip()
+        else:
+            kwargs["url"] = q
+\end{lstlisting}
+
+\textbf{Why this normalisation?} ReAct agents emit \texttt{TOOL\_CALL: tool\_name | query} as a single string. The registry must be able to dispatch this without requiring agents to know each tool's exact parameter names.
+
+\subsection{Current Tools}
+
+\begin{tabular}{lll}
+\toprule
+\textbf{Tool} & \textbf{Backend} & \textbf{Pipeline role} \\
+\midrule
+\texttt{search}          & DuckDuckGo / Brave fallback & KG construction (triggers search→visit chain) \\
+\texttt{visit}           & async HTTP + LLM summariser & KG construction (full page content) \\
+\texttt{wikipedia}       & Wikipedia REST API & KG construction \\
+\texttt{scholar}         & Semantic Scholar API & KG construction (academic) \\
+\texttt{table}           & BeautifulSoup HTML parser & KG construction (structured numeric data) \\
+\texttt{calculator}      & Python \texttt{eval} sandbox & QC advanced solver \\
+\texttt{unit\_converter} & Pint library & QC advanced solver \\
+\texttt{timeline}        & Date arithmetic & QC advanced solver \\
+\texttt{comparison}      & LLM self-knowledge & QC advanced solver \\
+\texttt{python}          & Sandboxed \texttt{exec} & QC advanced solver \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\textbf{Why retrieval tools are excluded from QC-only use during KG building:} \texttt{comparison} uses LLM parametric knowledge, not external retrieval. Allowing it during KG construction would introduce non-retrieved claims into the KG, breaking the traceability guarantee (every KG node = one external tool call). This boundary is enforced by \texttt{GraphBuilder.\_pick\_tools()}, which only selects \texttt{search}, \texttt{wikipedia}, \texttt{scholar}.
+
+\subsection{Adding a Tool}
+
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item Create \texttt{src/tools/mytool.py}:
+\begin{lstlisting}[style=py]
+class MyTool(BaseTool):
+    name = "mytool"
+    description = "One sentence for LLM. Usage: mytool | <query>"
+
+    def __init__(self, config: dict = {}):
+        self.config = config
+
+    async def execute(self, query: str = "", **kwargs) -> dict:
+        result = ...  # your retrieval logic
+        return {"result": result, "cached": False}
+\end{lstlisting}
+
+  \item Register in \texttt{scripts/generate\_until\_pass.py} (or \texttt{orchestrator.py}):
+\begin{lstlisting}[style=py]
+from src.tools.mytool import MyTool
+registry.register(MyTool(cfg.get("mytool", {})))
+\end{lstlisting}
+
+  \item Add config in \texttt{configs/tool\_config.yaml}:
+\begin{lstlisting}[style=py, language=yaml]
+mytool:
+  api_key: ${MY_API_KEY}
+  max_results: 5
+\end{lstlisting}
+
+  \item The tool is now available to both graph escalation and the advanced solver automatically. The LLM learns to use it from its \texttt{description} string — no prompt changes needed.
+\end{enumerate}
+
+\textbf{To restrict a tool to KG construction only:} do not register it in the \texttt{generate\_until\_pass.py} registry (which is also used for QC). Register it only in a custom \texttt{GraphBuilder} invocation.
+
+\textbf{To restrict a tool to QC only:} register it normally but exclude it from \texttt{GraphBuilder.\_pick\_tools()} by not adding it to the \texttt{preferred} list there.
+
+\textbf{Caching.} Tools should cache at \texttt{data/.cache/\{toolname\}/\{sha256(query)\}.json}. The \texttt{wikipedia\_tool} and \texttt{scholar\_tool} implement this pattern. Caching is optional but prevents duplicate API calls during KG rebuilds and QC reruns.
+
+% ============================================================
+\section{Knowledge Graph Construction}
+\label{sec:kg}
+
+\textbf{File:} \texttt{src/graph/graph\_builder.py}, \texttt{src/graph/knowledge\_graph.py}
+
+\subsection{Atomic Fact Model}
+
+\textbf{Design constraint:} every KG node represents exactly one indivisible fact from exactly one tool call. The \texttt{tool\_source} and \texttt{tool\_query} fields trace each node to its retrieval step. This is not just for provenance display; it is used during cross-topic edge discovery to label which tool produced each group, and by \texttt{describe\_subgraph} to generate the entity description shown in QA generation prompts.
+
+\textbf{Why atomic?} Composite nodes (e.g.\ a Wikipedia paragraph) produce ambiguous edges. An edge between a composite node A and composite node B does not specify which fact in A relates to which fact in B. Atomic nodes allow precise edge typing (\texttt{quantifies}, \texttt{causes}, etc.) and prevent vague ``related to'' edges that add no reasoning value.
+
+\subsection{Build Process (\texttt{build\_from\_seeds})}
+
+\begin{algorithm}
+\caption{\texttt{GraphBuilder.build\_from\_seeds}}
+\begin{algorithmic}[1]
+\Require seed\_entities $S$, expansion\_rounds $R$, cross\_topic\_sample $K$
+\State frontier $\leftarrow S$; expanded $\leftarrow \emptyset$; seed\_repr\_groups $\leftarrow \{\}$
+\For{round $= 1 \ldots R$}
+  \State round\_groups $\leftarrow []$
+  \For{topic \textbf{in} frontier $\setminus$ expanded}
+    \State expanded $\leftarrow$ expanded $\cup \{$topic$\}$
+    \For{tool \textbf{in} [search, wikipedia, scholar]}
+      \State entity\_ids $\leftarrow$ \texttt{\_lookup\_and\_atomise(tool, topic)}
+      \State round\_groups.append(\{tool, topic, entity\_ids, seed\_topic\})
+      \State update seed\_repr\_groups[seed\_topic] if largest group for that seed
+    \EndFor
+  \EndFor
+  \For{$(g_a, g_b)$ \textbf{in} pairs(round\_groups)}
+    \State \texttt{\_discover\_edges}$(g_a, g_b)$
+  \EndFor
+  \State next\_frontier $\leftarrow$ key\_terms from round\_groups entities, $[:$max\_entities\_per\_expansion$]$
+\EndFor
+\If{cross\_topic\_edges}
+  \For{each group $g_a$ \textbf{in} seed\_repr\_groups}
+    \State partners $\leftarrow$ random.sample(other seeds, $K$)
+    \For{$g_b$ \textbf{in} partners where $g_b$.seed\_topic $\neq$ $g_a$.seed\_topic}
+      \State \texttt{\_discover\_edges}$(g_a, g_b$, max\_edges=3$)$
+    \EndFor
+  \EndFor
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Per-tool fact caps.} \texttt{\_DEFAULT\_TOOL\_FACT\_CAPS = \{search: 8, wikipedia: 4, scholar: 3\}}. The search cap is higher because \texttt{search} triggers the search→visit chain (fetching full page content), yielding far more distinct facts than the snippet-only fallback. Wikipedia and Scholar return fixed-length snippets/abstracts where diminishing returns kick in early.
+
+\paragraph{Expansion frontier.} After each round, \texttt{key\_terms} are extracted from newly created entity attributes and used as the next frontier, capped at \texttt{max\_entities\_per\_expansion=10}. This implements depth-limited expansion: round 1 covers the seeds, round 2 covers closely related terms. The cap prevents exponential growth while still discovering second-order facts.
+
+\subsection{Search→Visit Chain (\texttt{\_lookup\_and\_atomise\_search})}
+
+For \texttt{tool\_name == "search"} when \texttt{visit} is registered:
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item DuckDuckGo search (retry 3× with 3s backoff per attempt, rate-limit mitigation)
+  \item Filter results to those with both \texttt{url} and non-trivial \texttt{snippet}
+  \item Visit top 3 URLs concurrently (\texttt{asyncio.gather}), goal: ``Extract facts about: \{query\}''
+  \item Extract HTML tables from same 3 URLs concurrently via \texttt{TableTool}
+  \item Concatenate: snippets + page text + table text (in that order, total $\leq$5000 chars to \texttt{FACT\_EXTRACTION\_PROMPT})
+  \item Atomise combined text into $\leq$ 8 \texttt{AtomicFact} objects
+  \item Node \texttt{tool\_source} is set to \texttt{"search+visit"} (not \texttt{"search"}) for transparency
+\end{enumerate}
+
+\textbf{Why visit?} Snippet text (140--200 chars) produces 1--2 atomic facts per result. Full page text (2000--3000 chars) produces 5--8. The search→visit chain makes \texttt{search} the richest knowledge source in the pipeline.
+
+\textbf{Why concatenate snippets first?} If page fetch fails (timeout, JavaScript-rendered page), the snippet is still present. The LLM sees at least some content regardless.
+
+\subsection{Isomorphic Table Extraction (\texttt{TableTool})}
+
+BeautifulSoup extracts all \texttt{<table>} elements from each visited page. Per page: up to 3 tables, up to 20 rows each. Each row is converted to \texttt{\{header: value, ...\}} dicts. Caption is inferred from \texttt{<caption>} or the preceding \texttt{<h*>} element. Output is formatted as plain text appended to the page content before atomisation.
+
+\textbf{Why?} Numeric and comparative facts (dates, rankings, quantities) are systematically underrepresented in prose. Tables contain exactly this class of facts. The Tongyi paper (§3.4.1) explicitly cites table extraction as a parallel knowledge source for ``isomorphic tables''.
+
+\subsection{Intra-Group Edges}
+
+After atomising a single tool lookup, all resulting entity nodes are connected with \texttt{same\_topic} edges. This guarantees that each lookup's nodes form a connected component:
+
+\begin{lstlisting}[style=py]
+for i, eid_a in enumerate(entity_ids):
+    for eid_b in entity_ids[i + 1:]:
+        shared = set(ea.key_terms) & set(eb.key_terms)
+        kg.add_relation(Relation(
+            source_id=eid_a, target_id=eid_b,
+            relation_type="same_topic",
+            evidence=(f"Shared terms: {shared}" if shared
+                      else f"Same lookup: {tool}('{query}')")
+        ))
+\end{lstlisting}
+
+\textbf{Why all-pairs?} A star topology (one hub node connected to all others) would create a higher-degree hub that biases degree-sorted candidate selection during escalation. All-pairs keeps degree distribution uniform within lookup groups.
+
+\subsection{Inter-Group Edge Discovery (\texttt{\_discover\_edges})}
+
+\texttt{EDGE\_DISCOVERY\_PROMPT} asks the LLM: given facts from group A (tool A, query A) and facts from group B (tool B, query B), what typed relations exist between them? Returns \texttt{EdgeSuggestion(source\_name, target\_name, relation)}.
+
+Name→ID resolution is case-insensitive exact match against the group's entity IDs. Edges that fail name resolution are silently dropped (no partial match, no fuzzy matching).
+
+\textbf{Why LLM for edge discovery rather than keyword overlap?} Keyword overlap only finds lexically similar facts. The most valuable edges (e.g.\ Shannon entropy → black hole thermodynamics Bekenstein--Hawking entropy) have zero keyword overlap but strong conceptual relationship. LLM edge discovery finds these.
+
+\subsection{Cross-Topic Edge Discovery}
+\label{sec:crosstopic}
+
+After all expansion rounds, the builder runs one cross-topic pass over the largest-group representative per seed topic. For each group $g_a$, \texttt{cross\_topic\_sample=3} partner groups from different seeds are sampled without replacement and \texttt{\_discover\_edges($g_a$, $g_b$, max\_edges=3)} is called.
+
+\textbf{Why this is necessary:} Without cross-topic edges, each seed topic's nodes form an isolated clique. The KG before this pass had 7 disconnected components (Louvain modularity 0.780). After: 1 connected component (modularity 0.551). Disconnected topics mean the subgraph sampler cannot produce cross-domain questions; bridging sampling would always fail to connect components.
+
+\textbf{Why \texttt{cross\_topic\_sample=3} and not all pairs?} Full all-pairs over 14 seeds is $\binom{14}{2}=91$ API calls at max\_edges=3 each. With $K=3$ partners per group, the expected number of cross-topic discovery calls is $14 \times 3 / 2 = 21$ (each pair counted once). This achieves broad connectivity without a $4\times$ API cost increase.
+
+\textbf{Why the largest group per seed as representative?} Larger groups have more entities, increasing the probability that the LLM finds a valid cross-domain edge. Groups are selected during expansion: the group with the most entity IDs produced for that seed topic is tracked and used.
+
+% ============================================================
+\section{Knowledge Graph Data Structure}
+\label{sec:kgds}
+
+\textbf{File:} \texttt{src/graph/knowledge\_graph.py}
+
+Backed by \texttt{networkx.DiGraph}. Entities stored in \texttt{\_entities: dict[str, Entity]} (id → Entity). Relations stored in \texttt{\_relations: list[Relation]} (append-only). The DiGraph stores only IDs as node/edge keys; full entity/relation objects live in the parallel dicts.
+
+\textbf{Why DiGraph rather than MultiDiGraph?} A single directed edge per (source, target) pair is sufficient. Multiple edge types between the same pair are represented by the strongest/first added; \texttt{add\_edge} silently overwrites if the pair already exists. This is intentional: duplicate edges from multiple lookup groups add no structural information and would inflate the neighbour lists used during escalation candidate selection.
+
+\textbf{Why parallel dict + DiGraph?} NetworkX node attributes are accessible via \texttt{kg.graph.nodes[id]['name']} but are not typed. The parallel \texttt{\_entities} dict provides typed, Pydantic-validated entity objects. This avoids the overhead of re-validating on every access and allows IDE type-checking.
+
+\textbf{Random walk implementation:}
+
+\begin{lstlisting}[style=py]
+def random_walk(self, start_id: str, steps: int) -> list[str]:
+    visited = [start_id]; current = start_id
+    for _ in range(steps):
+        neighbors = list(self.graph.successors(current)) \
+                  + list(self.graph.predecessors(current))
+        if not neighbors: break
+        current = random.choice(neighbors)
+        visited.append(current)
+    return visited
+\end{lstlisting}
+
+Walk is on the \emph{undirected} view (successors + predecessors) even though the graph is directed. \textbf{Reason:} KG edges are directional by type (causes A→B, supports A→B) but both endpoints are informative regardless of direction. Restricting to successors only would make the walk heavily biased toward high-out-degree hub nodes and fail to reach leaf nodes.
+
+% ============================================================
+\section{Subgraph Sampling}
+\label{sec:sampling}
+
+\textbf{File:} \texttt{src/graph/subgraph\_sampler.py}
+
+Two strategies alternate: even-indexed attempts use random walk, odd-indexed use bridging. The alternation is deterministic by attempt index, not random, to ensure both strategies are used in every batch.
+
+\subsection{Random Walk Sampling}
+
+\begin{lstlisting}[style=py]
+def sample_by_random_walk(self, min_entities, max_entities, walk_length):
+    start = random.choice(entities)
+    walked = kg.random_walk(start.id, walk_length)
+    # deduplicate preserving order
+    unique = list(dict.fromkeys(walked))[:max_entities]
+    # pad to min_entities by adding random neighbors if needed
+    if len(unique) < min_entities: ...
+    return _ensure_connected(unique)
+\end{lstlisting}
+
+\textbf{walk\_length is the primary diameter lever.} Longer walks traverse more graph distance before deduplication and trimming. A walk of length 10 on a diameter-12 graph will typically visit nodes with average pairwise distance $\sim$3--4. A walk of length 30 will visit nodes with average pairwise distance $\sim$6--8. This is the mechanism behind the complexity scaling.
+
+\textbf{Why deduplicate preserving order?} The walk visits nodes multiple times (it revisits neighbors). Deduplication with order preservation keeps the first-visited (earliest in walk) instances, which are closest to the start node. Later entries in the walk are farther from the start and are trimmed first by the \texttt{[:max\_entities]} slice, preserving the most locally clustered nodes.
+
+\subsection{Bridging Sampling}
+
+\begin{lstlisting}[style=py]
+def sample_bridging(self, n_components, entities_per_component):
+    seeds = random.sample(entities, n_components)
+    for seed in seeds:
+        neighbors = kg.get_neighbors(seed.id, hops=2)
+        local = [seed.id] + neighbors[:entities_per_component - 1]
+        all_ids.extend(local)
+    return _ensure_connected(deduplicate(all_ids))
+\end{lstlisting}
+
+\textbf{get\_neighbors uses hops=2 (2-hop BFS), not 1-hop.} This ensures each local neighborhood has enough nodes even for low-degree seeds. The \texttt{entities\_per\_component} cap limits how many are included.
+
+\textbf{Why bridging?} Random walk tends to stay in dense local neighborhoods. Bridging forces cross-cluster inclusion by design. The key insight is that cross-domain questions (e.g.\ connecting CRISPR to black hole thermodynamics via Shannon entropy) require subgraphs that span multiple topic clusters. These cannot arise from random walk on a dense local neighborhood.
+
+\subsection{Connectivity Guarantee (\texttt{\_ensure\_connected})}
+
+Both sampling methods can produce disconnected induced subgraphs, especially when:
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item Random neighbors are added to meet \texttt{min\_entities} and they don't lie on the walk path
+  \item Bridging samples from graph regions not yet cross-linked
+\end{itemize}
+
+\texttt{\_ensure\_connected} converts the KG to an undirected view, finds connected components in the induced subgraph via \texttt{nx.connected\_components}, then for each non-anchor component:
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item Samples up to 3 nodes from the anchor and up to 3 from the component
+  \item Finds the shortest undirected path between each pair via \texttt{nx.shortest\_path}
+  \item Inserts intermediate nodes (path[1:-1]) into the result set
+\end{enumerate}
+
+\textbf{Known issue: noise nodes.} At high complexity, \texttt{\_ensure\_connected} inserts KG construction artifacts (\texttt{"query executed"}, \texttt{"initial lookup"}, \texttt{"number of results"}) as connector nodes. These were created during KG building when tool result parsing extracted meta-strings as entity names. They inflate subgraph size without adding reasoning value. Fix: add a blocklist filter in \texttt{build\_from\_seeds} that rejects entities whose names match artifact patterns before they enter the KG.
+
+% ============================================================
+\section{QA Generation from Subgraph}
+\label{sec:qagen}
+
+\textbf{File:} \texttt{src/graph/subgraph\_sampler.py} (\texttt{generate\_qa\_from\_subgraph})
+
+The LLM receives \texttt{kg.describe\_subgraph(entity\_ids)}: a formatted list of all entities with their values and tool sources, followed by all relations between them with evidence strings.
+
+The prompt (\texttt{prompts/graph\_qa\_generator.txt}) instructs the LLM to write a question that:
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item Requires connecting at least 3 entities from the subgraph
+  \item Has a definitive, verifiable answer
+  \item Cannot be answered from any single entity alone
+  \item Does not name-drop entities gratuitously (answer must follow from their relationships)
+\end{itemize}
+
+Response schema: \texttt{GraphQAResponse(question, answer, reasoning, entities\_required)}.
+
+\texttt{entities\_required} is recorded in \texttt{qa.metadata["entities\_required"]} for post-hoc analysis but does not affect downstream processing.
+
+% ============================================================
+\section{Uncertainty Injection}
+\label{sec:uncertainty}
+
+\textbf{File:} \texttt{src/graph/uncertainty\_injector.py}
+
+Six atomic operations, applied sequentially (n=1 in \texttt{generate\_until\_pass.py}, configurable to n=2 via orchestrator):
+
+\begin{tabular}{lp{10cm}}
+\toprule
+\textbf{Operation} & \textbf{Transformation} \\
+\midrule
+\texttt{entity\_merging} & Replace entity name with a description that could match multiple entities \\
+\texttt{temporal\_displacement} & Add or change temporal constraints (\texttt{as of 2019}, \texttt{during Cold War}) \\
+\texttt{attribute\_substitution} & Replace easy attribute with harder one (\texttt{capital} → \texttt{second-largest city by population}) \\
+\texttt{condition\_injection} & Add a filtering condition (\texttt{among EU member states}, \texttt{excluding island nations}) \\
+\texttt{aggregation\_requirement} & Require combining data across entities (\texttt{total} → \texttt{average per capita weighted by population}) \\
+\texttt{indirection} & Add an intermediate reasoning step (ask about a property of X via Y) \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+
+Operations work \emph{within the existing subgraph} — no new entities are added. This is the key distinction from graph escalation (Section~\ref{sec:escalation}).
+
+Implementation: each operation calls \texttt{complete\_json(messages, InjectionResponse)} where \texttt{InjectionResponse(question, answer, explanation)} includes the modified question and updated answer. The answer must be updated because some operations change what the correct answer is (e.g.\ \texttt{condition\_injection} may narrow the answer set).
+
+\texttt{inject\_multiple} applies $n$ randomly sampled operations sequentially: \texttt{random.sample(ops, min(n, len(ops)))}. Operations are applied to the output of the previous operation (composition). If any operation raises, the partial result is kept.
+
+\textbf{Why sequential rather than parallel?} Each operation's output is the next operation's input. Applying operations to the original QA in parallel and merging would produce contradictory transformations (e.g.\ two operations that both modify the entity name).
+
+\subsection{Adding an Uncertainty Operation}
+
+Add to the \texttt{OPERATIONS} dict in \texttt{uncertainty\_injector.py}:
+\begin{lstlisting}[style=py]
+OPERATIONS["my_operation"] = (
+    "Description of what the LLM should do to the question. "
+    "Be specific: what changes, what must be preserved."
+)
+\end{lstlisting}
+
+No other changes required. The operation is sampled uniformly with all others during \texttt{inject\_multiple}. To bias toward specific operations, modify \texttt{inject\_multiple} to use weighted sampling:
+\begin{lstlisting}[style=py]
+weights = [op_weights.get(op, 1.0) for op in ops]
+selected = random.choices(ops, weights=weights, k=n_operations)
+\end{lstlisting}
+
+% ============================================================
+\section{Graph Complexity Escalation}
+\label{sec:escalation}
+
+\textbf{File:} \texttt{src/pipeline/stage2\_graph\_escalation.py}
+
+\subsection{Single Escalation Round}
+
+\begin{algorithm}
+\caption{\texttt{GraphComplexityEscalator.\_escalate\_one\_round}}
+\begin{algorithmic}[1]
+\Require qa (with source\_chunk\_ids), kg, max\_tool\_calls
+\State covered $\leftarrow$ \{eid $\in$ qa.source\_chunk\_ids $\cap$ kg entities\}
+\State candidates $\leftarrow$ \texttt{\_find\_extension\_candidates}(kg, covered) \Comment{1-hop neighbors, degree-sorted, cap 12}
+\State Build system prompt: current Q/A, entity descriptions of covered + candidates, tool list
+\State conversation $\leftarrow$ [system\_msg]
+\For{$t = 1 \ldots$ max\_tool\_calls+1}
+  \State response $\leftarrow$ \texttt{llm.complete}(conversation)
+  \State conversation.append(\{role: assistant, content: response\})
+  \If{response matches \texttt{TOOL\_CALL: (\textbackslash w+) | (.+)}}
+    \State result $\leftarrow$ \texttt{registry.execute}(tool\_name, query=tool\_query)
+    \State conversation.append(\{role: user, content: "OBSERVATION: " + result[:2000]\})
+  \Else
+    \State parsed $\leftarrow$ \texttt{\_extract\_response}(response) \Comment{JSON from code block or \{.*\}}
+    \If{parsed} \textbf{break} \EndIf
+  \EndIf
+\EndFor
+\State new\_ids $\leftarrow$ \texttt{\_resolve\_entity\_ids}(kg, parsed.entities\_incorporated)
+\State connector\_ids $\leftarrow$ \texttt{\_find\_connector\_nodes}(kg, covered, new\_ids)
+\State escalated.source\_chunk\_ids $\leftarrow$ covered $\cup$ new\_ids $\cup$ connector\_ids
+\Return escalated
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Candidate selection (\texttt{\_find\_extension\_candidates}).}
+Candidates are 1-hop neighbors (\texttt{\_CANDIDATE\_HOPS=1}) of the covered entity set, not already in the covered set, sorted by \texttt{kg.graph.degree(eid)} descending, capped at \texttt{\_MAX\_CANDIDATES=12}. One random node from the tail (beyond top 11) is added to prevent always picking the same high-degree hub nodes.
+
+\textbf{Why 1-hop only?} Guarantees every candidate has at least one direct edge to the existing subgraph. 2-hop candidates may be connected only through an intermediate node not in the subgraph, which would require adding connector nodes and produce unexpected subgraph expansions.
+
+\textbf{Why degree-sorted?} High-degree nodes connect to more of the existing subgraph and more of the graph overall. They produce richer escalation opportunities and are more likely to appear in valid multi-hop chains.
+
+\paragraph{ReAct loop termination.} The loop runs up to \texttt{max\_tool\_calls+1} iterations. It terminates early when the LLM emits JSON instead of a \texttt{TOOL\_CALL} directive. If the loop exhausts without a valid JSON response, a \texttt{RuntimeError} is raised and the original QA is kept (escalation failed gracefully).
+
+\paragraph{Connector node insertion (\texttt{\_find\_connector\_nodes}).} After resolving entity names to IDs, for each new entity that has no direct edge to any covered entity, the shortest undirected path in the full KG is found and intermediate nodes are inserted. This maintains subgraph connectivity invariant.
+
+\subsection{Five Escalation Strategies}
+
+\begin{tabular}{lp{6cm}p{4cm}}
+\toprule
+\textbf{Strategy} & \textbf{Prompt instruction} & \textbf{Topological effect} \\
+\midrule
+\texttt{hop\_extension} & Add one more reasoning hop: ask about a property of an entity adjacent to a key entity & Linear chain lengthening \\
+\texttt{subgraph\_bridging} & Connect two currently separate clusters via an intermediate relationship & Highest diameter increase \\
+\texttt{multi\_entity\_aggregation} & Aggregate/compare across all entities matching a condition (rank, find max, compute total) & Width over depth \\
+\texttt{constraint\_chain} & Chain of filtering constraints, each from a different entity & Sequential narrowing \\
+\texttt{inverse\_reasoning} & Flip lookup direction: given a property value, find which entity has it & Forces search over retrieval \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+
+\textbf{Strategy selection at runtime} (in \texttt{generate\_until\_pass.py}): when \texttt{strategy\_weights} is not None (i.e.\ complexity flag is set), the module-level \texttt{STRATEGIES} list in \texttt{stage2\_graph\_escalation} is temporarily replaced with a weighted sample drawn via \texttt{random.choices}. This is a deliberate monkeypatching approach: the escalator reads \texttt{STRATEGIES} from the module namespace at each call, so replacing the list has immediate effect.
+
+\textbf{Warning:} this monkeypatch is not thread-safe. In a multi-process setup, use a different mechanism (e.g.\ pass weights into \texttt{escalate\_batch} as a parameter).
+
+\subsection{Adding an Escalation Strategy}
+
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item Add the strategy name string to \texttt{STRATEGIES} in \texttt{stage2\_graph\_escalation.py}.
+  \item Add a description of the strategy to \texttt{prompts/graph\_escalation.txt} in the strategy list section. The LLM chooses which strategy to apply based on this description and its reasoning about the current entities.
+  \item Add a complexity affinity to \texttt{\_STRATEGY\_AFFINITY} in \texttt{generate\_until\_pass.py} (0.0 = prefer at low cx, 1.0 = prefer at high cx).
+\end{enumerate}
+
+The escalator does not enforce which strategy is applied — the LLM selects from the strategy descriptions in the prompt. \texttt{parsed.strategy} is the LLM's self-reported choice, recorded in \texttt{qa.metadata["strategy"]}.
+
+% ============================================================
+\section{Continuous Complexity Control}
+\label{sec:complexity}
+
+\textbf{File:} \texttt{scripts/generate\_until\_pass.py}, \texttt{complexity\_params()}
+
+\subsection{Design: Generative Parameter Scaling vs Post-Hoc Filtering}
+
+A post-hoc filter (generate large pool, keep questions above difficulty threshold) has two problems: (1) the filter metric is correlated with the training objective, making the pipeline circular; (2) discarded questions represent wasted API cost proportional to the rejection rate.
+
+Instead, the \texttt{--complexity} flag ($c \in [0,1]$) scales subgraph sampling parameters. When \texttt{--complexity} is omitted, \texttt{complexity\_params(None)} returns the original fixed defaults, and the pipeline is completely unchanged.
+
+\subsection{Parameter Scaling}
+
+All parameters scale linearly with $c$:
+
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Parameter} & $c=0$ & $c=1$ & \textbf{Mechanism} \\
+\midrule
+\texttt{walk\_length}        & 10 & 30 & Primary diameter lever (longer walk = farther nodes) \\
+\texttt{walk\_min}           &  2 &  6 & Minimum subgraph size \\
+\texttt{walk\_max}           &  5 & 12 & Maximum subgraph size \\
+\texttt{bridge\_components}  &  2 &  4 & Number of distant clusters in bridging \\
+\texttt{bridge\_per\_comp}   &  2 &  4 & Local neighborhood size per cluster \\
+\texttt{esc\_rounds}         &  1 &  1 & Fixed (1 round provides marginal gain over 0 rounds at high cost) \\
+\texttt{max\_tool\_calls\_qc}& 8  & 12 & Advanced solver budget (harder questions need more tool calls) \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+
+Strategy weights:
+\begin{equation}
+w_i(c) = \max(0.05,\; a_i \cdot c + (1-a_i)(1-c))
+\end{equation}
+
+where $a_i \in [0,1]$ is the affinity of strategy $i$:
+\texttt{hop\_extension}=0.1, \texttt{subgraph\_bridging}=0.8, \texttt{multi\_entity\_aggregation}=0.7, \texttt{constraint\_chain}=0.5, \texttt{inverse\_reasoning}=0.4.
+
+Weights are normalised to sum to 1. The floor of 0.05 prevents any strategy from being completely excluded.
+
+\subsection{Why esc\_rounds is Fixed at 1}
+
+Escalation adds at most 1-hop extensions per round. The topological ceiling is set at sampling time (walk\_length, bridge\_components). Running 3 escalation rounds triples API cost but yields diminishing returns: the third hop can only extend from whatever the second round added, which can only extend from the first round, which can only extend by 1 hop from the original subgraph. The net diameter increase from 3 rounds is at most 3, but the expected increase is less because the LLM often incorporates entities that are already 1-hop from the original subgraph rather than extending further.
+
+If you want escalation to be a genuine complexity amplifier, the correct fix is: (1) require a minimum post-escalation diameter before accepting the result, (2) pass a complexity target as a constraint to the escalation prompt.
+
+\subsection{Empirical Results}
+
+Four generation runs, 5 batches of 5 QAs each:
+
+\begin{tabular}{lrrrr}
+\toprule
+cx & Generated & TOO\_EASY & TOO\_HARD & PASS \\
+\midrule
+0.10 & 25 & 3 & 11 & 10 (40\%) \\
+0.40 & 25 & 0 &  6 & 19 (76\%) \\
+0.70 & 25 & 2 &  9 & 13 (52\%) \\
+0.95 & 25 & 0 &  6 & 19 (76\%) \\
+\midrule
+Total & 100 & 5 & 32 & 61 (61\%) \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+
+The cx=0.1 pass rate of 40\% is almost entirely due to the \texttt{lenient\_paraphrase} judge (Section~\ref{sec:judge}). Without it, the rate was $<$4\%. The cx=0.70 dip relative to cx=0.95 likely reflects a transition zone where questions are complex enough to be hard for the advanced solver but not clearly in \texttt{lenient\_partial} territory (which starts at $c>0.55$).
+
+% ============================================================
+\section{Quality Control}
+\label{sec:qc}
+
+\textbf{Files:} \texttt{src/pipeline/stage3\_quality\_control.py}, \texttt{src/agents/judge\_agent.py}, \texttt{src/agents/similarity\_scorer.py}
+
+\subsection{Pipeline}
+
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item \textbf{Base solver} (\texttt{solve\_base}): LLM with no tools. Judged \emph{strictly regardless of complexity}. If correct → \texttt{TOO\_EASY}. Rationale: easy questions must not slip through at any complexity level.
+  \item \textbf{Advanced solver} (\texttt{solve\_advanced}): ReAct loop with full tool access, up to \texttt{max\_tool\_calls\_qc = 8+4c} iterations. Judged with complexity-aware leniency. If incorrect → \texttt{TOO\_HARD}.
+  \item \textbf{Deduplication}: \texttt{SimilarityScorer.is\_duplicate} checks cosine similarity of \texttt{sentence-transformers/all-MiniLM-L6-v2} embeddings against all prior PASSes. Threshold: 0.85. If $\geq 0.85$ → \texttt{DUPLICATE}.
+  \item \textbf{PASS}: \texttt{scorer.add\_to\_index(qa)} to prevent future duplicates. Appended to \texttt{passing\_qas.jsonl} and \texttt{ui\_data.json}. Trajectory appended to \texttt{passing\_trajectories.jsonl}.
+\end{enumerate}
+
+\subsection{Complexity-Aware Judge}
+\label{sec:judge}
+
+\textbf{File:} \texttt{src/agents/judge\_agent.py}
+
+\begin{lstlisting}[style=py]
+def judge(self, reference, predicted, complexity=None) -> bool:
+    if complexity is None:
+        strictness = "strict"
+    elif complexity < 0.45:
+        strictness = "lenient_paraphrase"
+    elif complexity <= 0.55:
+        strictness = "strict"
+    else:
+        strictness = "lenient_partial"
+    # LLM called with strictness injected into judge prompt
+\end{lstlisting}
+
+Three judge modes, each a distinct section in \texttt{prompts/judge.txt}:
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item \textbf{lenient\_paraphrase} ($c < 0.45$): accept answer if semantically equivalent to reference, allowing synonym variation, different phrasing, minor additional detail. Rationale: small subgraphs produce obscure specific facts; the solver retrieves the right answer but phrasing diverges from the reference.
+  \item \textbf{strict} ($0.45 \leq c \leq 0.55$): require precise factual match. Rationale: mid-range questions are well-formed with clear single-sentence answers where phrasing ambiguity is not the main difficulty.
+  \item \textbf{lenient\_partial} ($c > 0.55$): accept if the core claim is correct, even if multi-part answer is incomplete. Rationale: multi-hop answers are long; the solver may correctly identify the key relationship but omit supporting detail that doesn't change the answer's correctness.
+\end{itemize}
+
+\textbf{Base solver is always strict (complexity=None).} The leniency only applies to the advanced solver judgment. This asymmetry is intentional: we do not want easy questions to pass because the base solver's wrong answer happened to be lenient-equivalent to the reference.
+
+\subsection{Deduplication Implementation}
+
+\texttt{SimilarityScorer} maintains \texttt{\_existing\_embeddings: list[np.ndarray]}. \texttt{is\_duplicate} encodes the new question, iterates over all existing embeddings computing cosine similarity, returns True if any exceed threshold. Linear search is $O(n)$ in the number of existing PASSes.
+
+\textbf{Why linear search instead of FAISS?} At 50--200 passing QAs per run, linear search is negligible. FAISS would require an additional dependency and index maintenance. Swap to FAISS if the dataset exceeds $\sim$10k QAs.
+
+\textbf{Why 0.85 threshold?} Empirically chosen. At 0.90, near-paraphrases pass (same question with different entity phrasing). At 0.80, topically related but distinct questions are incorrectly blocked.
+
+% ============================================================
+\section{Trajectory Capture}
+\label{sec:trajectory}
+
+The advanced solver's ReAct loop records each turn as a \texttt{TrajectoryStep}. Steps alternate between assistant turns (thought + optional TOOL\_CALL) and user turns (OBSERVATION). The full chain is stored in a \texttt{Trajectory} object and saved to \texttt{passing\_trajectories.jsonl} for every PASS.
+
+\textbf{Format compatibility:} the Tongyi paper (§3.4.2) describes two training modes: ReAct (full interleaved thought/tool/observation) and Context Management (trajectory summary + tool/observation). Both are reconstructable from the stored \texttt{Trajectory}: the full sequence is the ReAct format; a summary can be generated from \texttt{steps} filtered to \texttt{role=assistant} with \texttt{tool} populated.
+
+% ============================================================
+\section{Batch Generation Loop}
+\label{sec:batch}
+
+\textbf{File:} \texttt{scripts/generate\_until\_pass.py}
+
+\subsection{Async Architecture}
+
+All IO-bound operations are \texttt{async}. The main loop is \texttt{asyncio.run(main())}. Concurrency limits:
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item QA generation: \texttt{asyncio.Semaphore(8)} (caps concurrent LLM calls during subgraph generation)
+  \item Graph escalation: \texttt{max\_concurrent=6} (Semaphore in \texttt{escalate\_batch})
+  \item QC: \texttt{max\_concurrent=6} (Semaphore in \texttt{run\_qc\_batch})
+\end{itemize}
+
+The semaphore caps prevent OpenAI rate-limit errors. At batch\_size=8, the pipeline launches 16 concurrent QA generation attempts, of which the first 8 to succeed are kept. Failed attempts (subgraph connectivity failure, LLM error) return None and are excluded.
+
+\subsection{No Early Stopping}
+
+The loop runs all \texttt{max\_batches} batches. Early stopping was removed to maximise dataset size per run:
+\begin{lstlisting}[style=py]
+# Don't stop early — collect as many passing QAs as possible
+# if all_passing: break
+\end{lstlisting}
+
+\subsection{Output Files}
+
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item \texttt{passing\_qas.jsonl}: one JSON per line, appended (not overwritten) across runs. Contains full \texttt{QAPair.model\_dump()}.
+  \item \texttt{passing\_trajectories.jsonl}: one JSON per line, appended. Contains \texttt{Trajectory.model\_dump()} for each PASS. May be absent if the QA passed without a trajectory (e.g.\ orchestrator path).
+  \item \texttt{ui\_data.json}: single JSON object with \texttt{\{knowledge\_graph, qa\_pairs\}}. Merged incrementally: existing IDs are skipped, new PASSes appended to \texttt{qa\_pairs}.
+\end{itemize}
+
+% ============================================================
+\section{Configuration Reference}
+\label{sec:config}
+
+\subsection{\texttt{configs/llm\_config.yaml}}
+
+\begin{lstlisting}[style=py, language=yaml]
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    default_model: gpt-4o
+    # base_url: http://localhost:8000/v1  # uncomment for local vLLM
+default_provider: openai
+call_params:
+  # Per-agent call params, keyed by params_key
+  summary_agent:    {temperature: 0.3, max_tokens: 2000}
+  item_writer:      {temperature: 0.7, max_tokens: 4000}
+  solver_base:      {temperature: 0.6, max_tokens: 3000}
+  solver_advanced:  {temperature: 0.6, max_tokens: 8000}
+  judge:            {temperature: 0.1, max_tokens: 1000}
+  graph_escalation: {temperature: 0.7, max_tokens: 4000}
+\end{lstlisting}
+
+\textbf{Temperature rationale:} judge at 0.1 (deterministic, avoids random leniency swings); escalation at 0.7 (creative rewriting benefits from diversity); base solver at 0.6 (moderate sampling for diverse answer formulations).
+
+\subsection{\texttt{configs/tool\_config.yaml}}
+
+\begin{lstlisting}[style=py, language=yaml]
+enabled_tools: null  # null = all registered tools; or list of names to restrict
+search:    {provider: duckduckgo, max_results: 10}
+scholar:   {api_key: ${SEMANTIC_SCHOLAR_API_KEY}, max_results: 5}
+wikipedia: {max_length: 3000}
+visit:     {timeout: 15, max_length: 5000}
+table:     {timeout: 15, max_tables: 3, max_rows: 20}
+comparison: {}
+\end{lstlisting}
+
+\texttt{enabled\_tools} is checked in \texttt{PipelineOrchestrator.\_register\_tools}. The \texttt{generate\_until\_pass.py} script does not use this mechanism — it registers tools explicitly.
+
+\subsection{\texttt{configs/env.sh}}
+
+\begin{lstlisting}[style=py, language=bash]
+export OPENAI_API_KEY="..."
+export SEMANTIC_SCHOLAR_API_KEY="..."
+export BRAVE_API_KEY=""  # optional; search tool falls back to DuckDuckGo if empty
+\end{lstlisting}
+
+% ============================================================
+\section{Running and Extending the Pipeline}
+
+\subsection{Build or Rebuild the KG}
+
+\begin{lstlisting}[style=py, language=bash]
+# Full rebuild from all 14 seeds (~30 min, GPT-4o)
+python scripts/rebuild_kg.py
+
+# Add new seed topics to existing KG without rebuilding
+python scripts/expand_kg.py --seeds "new topic 1" "new topic 2"
+\end{lstlisting}
+
+\textbf{To add new seed topics:} add them to \texttt{data/seeds/seed\_entities.json} and run \texttt{expand\_kg.py}. The cross-topic pass is re-run after expansion to link new nodes to existing topics. Existing KG nodes are not modified.
+
+\subsection{Generate QA Pairs}
+
+\begin{lstlisting}[style=py, language=bash]
+# Original pipeline (no complexity scaling)
+python scripts/generate_until_pass.py --batches 5 --batch-size 8
+
+# With complexity control
+python scripts/generate_until_pass.py --complexity 0.7 --batches 5 --batch-size 8
+\end{lstlisting}
+
+\subsection{Specialising the Pipeline for a Domain}
+
+To generate QAs in a specific domain (e.g.\ biomedical):
+\begin{enumerate}[leftmargin=*,noitemsep]
+  \item Replace \texttt{data/seeds/seed\_entities.json} with domain-specific seeds.
+  \item Optionally restrict \texttt{tool\_config.yaml} \texttt{enabled\_tools} to domain-appropriate retrievers (e.g.\ \texttt{scholar} only for academic domains).
+  \item Rebuild the KG.
+  \item Adjust uncertainty operations: disable operations that don't make sense for the domain (e.g.\ \texttt{temporal\_displacement} is less useful for mathematical topics).
+  \item Adjust judge prompt (\texttt{prompts/judge.txt}) to account for domain-specific answer formats (e.g.\ chemical formula equivalences, numeric tolerances).
+\end{enumerate}
+
+\subsection{Modifying Prompts}
+
+All prompts are plain text files with Python \texttt{.format(**kwargs)} substitution. Variable names are the \texttt{\{...\}} placeholders in the file. Each prompt file is loaded once at agent/escalator construction time.
+
+\textbf{Prompt files and their variables:}
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item \texttt{graph\_qa\_generator.txt}: \texttt{\{subgraph\_description\}}
+  \item \texttt{graph\_escalation.txt}: \texttt{\{question, answer, current\_entities, extension\_candidates, tool\_descriptions, max\_tool\_calls\}}
+  \item \texttt{uncertainty\_injection.txt}: \texttt{\{operation\_name, operation\_description, question, answer, kg\_context\}}
+  \item \texttt{judge.txt}: \texttt{\{reference, predicted, strictness\}}
+  \item \texttt{summary\_agent.txt}: \texttt{\{text\}}
+  \item \texttt{item\_writer\_seed.txt} / \texttt{item\_writer\_escalate.txt}: item writer prompts (Track A)
+\end{itemize}
+
+% ============================================================
+\section{Visualiser}
+\label{sec:ui}
+
+\subsection{Server (\texttt{ui/serve.py})}
+
+Extends \texttt{http.server.SimpleHTTPRequestHandler}. Two additional endpoints:
+
+\begin{itemize}[leftmargin=*,noitemsep]
+  \item \texttt{POST /api/generate}: JSON body \texttt{\{complexity, batches, batch\_size, api\_key\}}. If \texttt{api\_key} is provided, it is written to an environment variable before spawning the subprocess (takes priority over \texttt{env.sh}). Spawns \texttt{generate\_until\_pass.py} as a subprocess. Thread-safe job state via \texttt{threading.Lock}.
+  \item \texttt{GET /api/status}: Returns \texttt{\{running: bool, complexity: float, elapsed\_s: float, log\_tail: list[str]\}} where \texttt{log\_tail} is the last 20 lines of subprocess stdout.
+\end{itemize}
+
+\texttt{GET} requests to \texttt{/data/output/*} are served as static files by the base handler.
+
+\subsection{Viewer (\texttt{ui/viewer.html})}
+
+D3.js force-directed graph. Data loaded from \texttt{/data/output/ui\_data.json}. Polling: \texttt{GET /api/status} every 2.5s while job is running. Auto-reload of \texttt{ui\_data.json} 1.2s after job completion.
+
+QA list: filter tabs (All / Pass / Too Easy / Too Hard), per-card complexity badge (color-coded 0.00--1.00), verdict badge, strategy badge, uncertainty operation badge. Detail panel: Q\&A tab, solver comparison tab (base vs.\ advanced answers), escalation chain tab (question text at each history step).
+
+KG view: subgraph nodes highlighted on QA selection, color-coded by tool source, zoom/pan/drag, node click popups.
+
+% ============================================================
+\section{Known Issues and Fix Locations}
+
+\paragraph{Noise nodes in high-cx subgraphs.} KG construction artifacts (``query executed'', ``number of results'') enter the graph as entity nodes when tool result parsing is too permissive. Fix: add a name blocklist filter in \texttt{GraphBuilder.\_lookup\_and\_atomise} before \texttt{kg.add\_entity}.
+
+\paragraph{Strategy monkeypatch is not thread-safe.} \texttt{generate\_until\_pass.py} temporarily replaces the module-level \texttt{STRATEGIES} list. Fix: pass \texttt{strategy\_weights} as a parameter to \texttt{escalate\_batch} and \texttt{\_escalate\_one\_round}, and use it in weighted strategy selection there.
+
+\paragraph{Deduplication is O(n) in PASS count.} \texttt{SimilarityScorer.is\_duplicate} iterates all existing embeddings. Above $\sim$10k PASSes, use FAISS: replace the list with a \texttt{faiss.IndexFlatIP} index.
+
+\paragraph{DuckDuckGo rate limiting.} The search tool retries 3× with 3s backoff. If DuckDuckGo is consistently rate-limiting, set a \texttt{BRAVE\_API\_KEY} in \texttt{env.sh} to use Brave Search instead.
+
+\paragraph{Entity name resolution in escalation is exact-match.} \texttt{\_resolve\_entity\_ids} requires case-insensitive exact match on entity name. LLM-generated \texttt{entities\_incorporated} lists often contain paraphrased names that fail resolution. Fix: add fuzzy string matching (e.g.\ \texttt{rapidfuzz.process.extractOne}) with a similarity threshold.
+
+\paragraph{Trajectory capture only in generate\_until\_pass.py path.} The \texttt{PipelineOrchestrator.run\_graph\_based} path does not capture trajectories (the \texttt{QuestionSolverAgent.solve\_advanced} return value is not threaded through QC to the output writer). Fix: modify \texttt{QualityController.evaluate\_single} to return the trajectory alongside the verdict.
+
+% ============================================================
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem{webfrontier2025}
+Qiao et al.
+\newblock WebFrontier: Synthesizing Agent Training Data via Iterative Complexity Escalation.
+\newblock \textit{arXiv:2509.13309v2}, 2025.
+
+\bibitem{tongyi2025}
+Anonymous.
+\newblock Tongyi DeepResearch: Scaling Agentic AI via Graph-Grounded Open-World Data Synthesis.
+\newblock \textit{arXiv:2510.24701v2}, 2025.
+
+\bibitem{yao2023react}
+Shunyu Yao et al.
+\newblock ReAct: Synergizing Reasoning and Acting in Language Models.
+\newblock \textit{ICLR 2023}.
+
+\end{thebibliography}
+
+\end{document}

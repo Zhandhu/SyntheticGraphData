@@ -1,0 +1,38 @@
+pipeline:
+  checkpoint_enabled: true
+  checkpoint_dir: "data/checkpoints/"
+
+stage1:
+  chunk_max_tokens: 1000
+  group_size: 3
+  min_shared_entities: 1
+  seeds_per_group: 2
+
+stage2:
+  escalation_rounds: 3
+  max_tool_calls_per_round: 5
+  strategies:
+    - knowledge_expansion
+    - conceptual_abstraction
+    - factual_grounding
+    - computational_formulation
+
+stage3:
+  similarity_threshold: 0.85
+
+graph:
+  expansion_rounds: 3
+  max_entities_per_expansion: 10
+  subgraph_min_nodes: 3
+  subgraph_max_nodes: 8
+  uncertainty_operations_per_qa: 2
+  uncertainty_operations:
+    - entity_merging
+    - temporal_displacement
+    - attribute_substitution
+    - condition_injection
+    - aggregation_requirement
+    - indirection
+  # Graph-aware complexity escalation (stage 4 of graph track)
+  graph_escalation_rounds: 2
+  max_tool_calls_per_round: 5

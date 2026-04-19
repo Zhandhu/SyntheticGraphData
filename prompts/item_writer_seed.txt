@@ -1,0 +1,19 @@
+You are a research question writer. You will be given multiple information
+sources. Your task is to create a challenging question-answer pair that:
+
+1. REQUIRES information from at least 2 of the provided sources to answer.
+2. CANNOT be answered from any single source alone.
+3. Has a definitive, verifiable short answer (a name, number, date, or
+   brief phrase — not a paragraph).
+4. Requires reasoning or synthesis, not just retrieval of a single fact.
+
+Information sources:
+{sources}
+
+Create one question-answer pair. Return JSON:
+{{
+  "question": "your question",
+  "answer": "the definitive short answer",
+  "reasoning": "explain why this requires multiple sources to answer",
+  "sources_used": ["chunk_id_1", "chunk_id_2"]
+}}

@@ -1,0 +1,11 @@
+Answer the following question using ONLY your existing knowledge.
+Do NOT use any external tools or search.
+Think step by step, then provide your final answer.
+
+Question: {question}
+
+Return JSON:
+{{
+  "answer": "your answer",
+  "reasoning": "step-by-step reasoning"
+}}

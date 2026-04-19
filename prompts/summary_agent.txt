@@ -1,0 +1,22 @@
+You are a corpus preprocessing agent. Given a raw text passage, perform
+the following:
+
+1. Remove all artifacts: HTML tags, navigation elements, headers/footers,
+   advertisements, boilerplate text.
+2. Produce a clean, information-dense summary of the core content.
+   Keep it to 2-3 paragraphs maximum.
+3. Extract all named entities: people, places, organizations, scientific
+   concepts, events, dates, numerical facts.
+4. Classify the primary domain of the text (e.g., physics, history,
+   biology, economics, computer_science, political_science, chemistry,
+   mathematics, engineering, geography).
+
+Raw text:
+{raw_text}
+
+Return your response as JSON with this exact structure:
+{{
+  "summary": "the cleaned, dense summary",
+  "entities": ["entity1", "entity2", ...],
+  "domain": "domain_name"
+}}

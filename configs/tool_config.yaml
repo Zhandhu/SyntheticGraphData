@@ -1,0 +1,76 @@
+# Set to a list to restrict which tools are available, or omit to enable all.
+# enabled_tools:
+#   - search
+#   - scholar
+#   - visit
+#   - python
+#   - wikipedia
+#   - calculator
+#   - knowledge_base
+#   - document_reader
+#   - unit_converter
+#   - timeline
+#   - comparison
+
+search:
+  provider: "brave"                  # primary; falls back to duckduckgo if no key
+  api_key: ${BRAVE_API_KEY}
+  max_results: 10
+  cache_enabled: true
+  cache_dir: "data/.cache/search/"
+
+scholar:
+  provider: "semantic_scholar"
+  api_key: ${SEMANTIC_SCHOLAR_API_KEY}
+  max_results: 5
+  cache_enabled: true
+  cache_dir: "data/.cache/scholar/"
+
+visit:
+  provider: "requests"
+  timeout: 15
+  max_content_tokens: 8000
+  cache_enabled: true
+  cache_dir: "data/.cache/visit/"
+
+python:
+  timeout: 30
+  allowed_imports:
+    - math
+    - numpy
+    - scipy
+    - statistics
+    - collections
+    - itertools
+    - datetime
+    - json
+    - csv
+    - re
+    - fractions
+    - decimal
+
+wikipedia:
+  language: "en"
+  max_chars: 8000
+  cache_enabled: true
+  cache_dir: "data/.cache/wikipedia/"
+
+knowledge_base:
+  data_dirs:
+    - "data/knowledge_bases/"
+  max_results: 10
+
+document_reader:
+  max_chars: 15000
+  cache_enabled: true
+  cache_dir: "data/.cache/documents/"
+
+comparison:
+  max_entities: 5
+
+table:
+  timeout: 15
+  max_tables: 3
+  max_rows: 20
+  cache_enabled: true
+  cache_dir: "data/.cache/table/"

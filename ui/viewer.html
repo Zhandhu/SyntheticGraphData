@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tongyi QA + Knowledge Graph Viewer</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e0e0e0; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+
+/* ── Header ── */
+.header { padding: 14px 24px; background: #161822; border-bottom: 1px solid #2a2d3a; display: flex; align-items: center; gap: 12px; }
+.header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+.header .badge { background: #3b82f6; color: #fff; padding: 2px 10px; border-radius: 12px; font-size: 11px; }
+
+/* ── Filter bar ── */
+.filter-bar { display: flex; gap: 0; background: #12141e; border-bottom: 1px solid #2a2d3a; }
+.filter-tab { padding: 9px 18px; font-size: 12px; cursor: pointer; color: #9ca3af; border-bottom: 2px solid transparent; transition: all 0.15s; user-select: none; display: flex; align-items: center; gap: 6px; }
+.filter-tab:hover { color: #e5e7eb; background: #1a1d2e; }
+.filter-tab.active { color: #fff; border-bottom-color: #3b82f6; }
+.filter-tab .count { background: #1e2130; border-radius: 10px; padding: 1px 7px; font-size: 11px; }
+.filter-tab.active .count { background: #3b82f644; color: #93c5fd; }
+.count-pass   { background: #05966944 !important; color: #6ee7b7 !important; }
+.count-easy   { background: #d9770622 !important; color: #fb923c !important; }
+.count-hard   { background: #dc262622 !important; color: #f87171 !important; }
+
+/* ── Main layout ── */
+.container { display: flex; flex: 1; min-height: 0; }
+
+/* ── Generate panel ── */
+.generate-bar { background: #0d0f1a; border-bottom: 1px solid #2a2d3a; padding: 12px 20px; display: flex; flex-direction: column; gap: 10px; flex-shrink: 0; }
+.gen-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.gen-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+.gen-value { font-size: 13px; color: #e5e7eb; min-width: 32px; text-align: right; }
+.gen-input { background: #161822; border: 1px solid #2a2d3a; border-radius: 6px; color: #e5e7eb; padding: 4px 8px; font-size: 13px; width: 64px; }
+.gen-input:focus { outline: none; border-color: #3b82f6; }
+.gen-slider { accent-color: #3b82f6; width: 160px; cursor: pointer; vertical-align: middle; }
+.gen-slider:disabled { opacity: 0.3; cursor: default; }
+.gen-btn { background: #3b82f6; color: #fff; border: none; border-radius: 6px; padding: 6px 18px; font-size: 13px; cursor: pointer; font-weight: 600; transition: background 0.15s; white-space: nowrap; }
+.gen-btn:hover:not(:disabled) { background: #2563eb; }
+.gen-btn:disabled { background: #374151; color: #6b7280; cursor: default; }
+.gen-check-label { font-size: 12px; color: #9ca3af; cursor: pointer; display: flex; align-items: center; gap: 5px; }
+.gen-status-row { font-size: 12px; color: #9ca3af; display: flex; align-items: center; gap: 10px; }
+.gen-log-box { background: #0a0c12; border: 1px solid #1e2130; border-radius: 6px; padding: 8px 12px; max-height: 100px; overflow-y: auto; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; color: #9ca3af; line-height: 1.7; margin-top: 6px; }
+.gen-log-pass { color: #6ee7b7; }
+.gen-log-err  { color: #f87171; }
+
+/* ── Left: QA list ── */
+.qa-panel { width: 380px; min-width: 380px; border-right: 1px solid #2a2d3a; overflow-y: auto; background: #12141e; }
+.qa-card { padding: 14px 18px; border-bottom: 1px solid #1e2130; cursor: pointer; transition: background 0.12s; }
+.qa-card:hover { background: #1a1d2e; }
+.qa-card.active { background: #1e2744; border-left: 3px solid #3b82f6; padding-left: 15px; }
+.qa-card .qa-meta { font-size: 11px; color: #6b7280; margin-bottom: 6px; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.qa-card .qa-question { font-size: 13px; line-height: 1.5; color: #d1d5db; }
+.qa-card .qa-answer-preview { font-size: 12px; color: #9ca3af; margin-top: 7px; padding-top: 7px; border-top: 1px solid #1e2130; }
+
+/* verdict badges */
+.badge-pass  { display:inline-block; padding:1px 8px; border-radius:4px; font-size:11px; font-weight:600; background:#05966922; color:#6ee7b7; border:1px solid #05966944; }
+.badge-easy  { display:inline-block; padding:1px 8px; border-radius:4px; font-size:11px; font-weight:600; background:#d9770622; color:#fb923c; border:1px solid #d9770644; }
+.badge-hard  { display:inline-block; padding:1px 8px; border-radius:4px; font-size:11px; font-weight:600; background:#dc262622; color:#f87171; border:1px solid #dc262644; }
+.badge-unc   { display:inline-block; padding:1px 7px; border-radius:4px; font-size:11px; background:#7c3aed22; color:#a78bfa; border:1px solid #7c3aed44; }
+.badge-strat { display:inline-block; padding:1px 7px; border-radius:4px; font-size:11px; background:#0284c722; color:#38bdf8; border:1px solid #0284c744; }
+.badge-cx    { display:inline-block; padding:1px 7px; border-radius:4px; font-size:11px; font-variant-numeric: tabular-nums; }
+
+/* ── Right panel ── */
+.right-panel { flex:1; display:flex; flex-direction:column; min-width:0; }
+
+/* ── Graph ── */
+.graph-container { flex:1; position:relative; background:#0a0c12; min-height:0; }
+.graph-container svg { width:100%; height:100%; }
+
+.graph-toolbar { position:absolute; top:12px; left:12px; display:flex; gap:8px; z-index:10; }
+.graph-btn { background:#161822ee; border:1px solid #2a2d3a; border-radius:6px; padding:6px 12px; font-size:12px; color:#9ca3af; cursor:pointer; transition:all 0.15s; }
+.graph-btn:hover { color:#e5e7eb; border-color:#4b5563; }
+.graph-btn.active { color:#93c5fd; border-color:#3b82f6; background:#1e2744ee; }
+
+.graph-stats { position:absolute; top:12px; right:12px; background:#161822ee; border:1px solid #2a2d3a; border-radius:8px; padding:10px 14px; font-size:11px; line-height:1.8; z-index:10; }
+.graph-stats .stat-row { display:flex; align-items:center; gap:8px; }
+.graph-stats .dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+
+/* ── Node tooltip card ── */
+#node-card {
+  position:absolute; z-index:100; background:#1a1d2e; border:1px solid #3b82f6;
+  border-radius:8px; padding:12px 16px; font-size:12px; max-width:280px;
+  box-shadow:0 4px 24px #00000088; pointer-events:none; display:none;
+}
+#node-card .nc-name  { font-weight:700; color:#93c5fd; margin-bottom:6px; font-size:13px; }
+#node-card .nc-row   { color:#9ca3af; margin-bottom:3px; }
+#node-card .nc-value { color:#e5e7eb; margin-top:6px; line-height:1.5; border-top:1px solid #2a2d3a; padding-top:6px; }
+
+/* ── Detail panel ── */
+.detail-panel { height:310px; min-height:310px; border-top:1px solid #2a2d3a; background:#12141e; overflow:hidden; display:flex; flex-direction:column; }
+.detail-tabs { display:flex; background:#0f1117; border-bottom:1px solid #2a2d3a; flex-shrink:0; }
+.detail-tab { padding:8px 18px; font-size:12px; cursor:pointer; color:#6b7280; border-bottom:2px solid transparent; transition:all 0.12s; }
+.detail-tab:hover { color:#e5e7eb; }
+.detail-tab.active { color:#fff; border-bottom-color:#3b82f6; }
+.detail-body { flex:1; overflow-y:auto; padding:16px 20px; }
+
+/* detail content */
+.detail-grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.detail-grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
+.d-section .d-label { font-size:10px; color:#6b7280; text-transform:uppercase; letter-spacing:0.6px; margin-bottom:5px; }
+.d-section .d-val   { font-size:13px; color:#e5e7eb; line-height:1.6; }
+.d-section .d-val.answer-ref  { color:#93c5fd; }
+.d-section .d-val.answer-base { color:#9ca3af; }
+.d-section .d-val.answer-adv  { color:#6ee7b7; }
+
+/* escalation chain */
+.chain { display:flex; align-items:flex-start; gap:0; flex-wrap:wrap; margin-top:2px; }
+.chain-step { background:#1e2130; border:1px solid #2a2d3a; border-radius:6px; padding:6px 10px; font-size:12px; color:#d1d5db; line-height:1.5; flex:1; min-width:180px; }
+.chain-step.current { border-color:#3b82f6; background:#1e2744; }
+.chain-arrow { align-self:center; padding:0 8px; color:#4b5563; font-size:18px; flex-shrink:0; }
+.chain-op { align-self:center; display:flex; flex-direction:column; align-items:center; gap:3px; padding:0 6px; flex-shrink:0; }
+.chain-op-badge { font-size:10px; padding:1px 7px; border-radius:10px; white-space:nowrap; }
+
+.empty-state { display:flex; align-items:center; justify-content:center; height:100%; color:#6b7280; font-size:14px; flex-direction:column; gap:8px; }
+
+/* scrollbar */
+::-webkit-scrollbar { width:6px; height:6px; }
+::-webkit-scrollbar-track { background:#0f1117; }
+::-webkit-scrollbar-thumb { background:#2a2d3a; border-radius:3px; }
+::-webkit-scrollbar-thumb:hover { background:#3f4458; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Tongyi QA · Knowledge Graph Viewer</h1>
+  <span class="badge" id="total-badge">0 pairs</span>
+</div>
+
+<div class="filter-bar">
+  <div class="filter-tab active" data-filter="all" onclick="setFilter('all')">
+    All <span class="count" id="cnt-all">0</span>
+  </div>
+  <div class="filter-tab" data-filter="PASS" onclick="setFilter('PASS')">
+    ✓ Pass <span class="count count-pass" id="cnt-PASS">0</span>
+  </div>
+  <div class="filter-tab" data-filter="TOO_EASY" onclick="setFilter('TOO_EASY')">
+    Too Easy <span class="count count-easy" id="cnt-TOO_EASY">0</span>
+  </div>
+  <div class="filter-tab" data-filter="TOO_HARD" onclick="setFilter('TOO_HARD')">
+    Too Hard <span class="count count-hard" id="cnt-TOO_HARD">0</span>
+  </div>
+  <div style="flex:1"></div>
+  <div class="filter-tab" id="gen-tab" onclick="toggleGeneratePanel()" style="border-left:1px solid #2a2d3a">
+    ⚡ Generate
+  </div>
+</div>
+
+<div class="generate-bar" id="generate-bar" style="display:none">
+  <div class="gen-row">
+    <!-- API key -->
+    <span class="gen-label">OpenAI API Key</span>
+    <input type="password" id="gen-api-key" placeholder="sk-…"
+           style="background:#161822;border:1px solid #2a2d3a;border-radius:6px;color:#e5e7eb;padding:4px 10px;font-size:13px;width:220px;font-family:monospace">
+  </div>
+  <div class="gen-row">
+    <!-- Complexity slider -->
+    <span class="gen-label">Complexity</span>
+    <input class="gen-slider" type="range" id="gen-complexity" min="0" max="1" step="0.05" value="0.5"
+           oninput="onComplexityChange()">
+    <span class="gen-value" id="gen-complexity-val">0.50</span>
+    <label class="gen-check-label">
+      <input type="checkbox" id="gen-original" onchange="onOriginalChange()">
+      Use original pipeline
+    </label>
+    <!-- Batch controls -->
+    <span class="gen-label" style="margin-left:12px">Batches</span>
+    <input class="gen-input" type="number" id="gen-batches" min="1" max="50" value="5">
+    <span class="gen-label">Batch size</span>
+    <input class="gen-input" type="number" id="gen-batch-size" min="1" max="20" value="8">
+    <button class="gen-btn" id="gen-btn" onclick="startGeneration()">Generate</button>
+  </div>
+  <!-- Status + log (shown while/after a job runs) -->
+  <div id="gen-status-area" style="display:none">
+    <div class="gen-status-row">
+      <span id="gen-status-text">Idle</span>
+    </div>
+    <div class="gen-log-box" id="gen-log-box"></div>
+  </div>
+</div>
+
+<div class="container">
+  <div class="qa-panel" id="qa-panel"></div>
+
+  <div class="right-panel">
+    <div class="graph-container" id="graph-container">
+      <div class="empty-state" id="graph-empty">
+        <div>Select a question to view its knowledge subgraph</div>
+      </div>
+
+      <div class="graph-toolbar" id="graph-toolbar" style="display:none">
+        <button class="graph-btn" id="btn-subgraph" onclick="toggleSubgraphOnly()">Subgraph only</button>
+        <button class="graph-btn" id="btn-labels" onclick="toggleLabels()">Hide labels</button>
+      </div>
+
+      <div class="graph-stats" id="graph-stats" style="display:none"></div>
+      <div id="node-card"></div>
+    </div>
+
+    <div class="detail-panel" id="detail-panel">
+      <div class="detail-tabs" id="detail-tabs" style="display:none">
+        <div class="detail-tab active" data-tab="qa" onclick="setDetailTab('qa')">Q &amp; A</div>
+        <div class="detail-tab" data-tab="solvers" onclick="setDetailTab('solvers')">Solver Comparison</div>
+        <div class="detail-tab" data-tab="chain" onclick="setDetailTab('chain')">Escalation Chain</div>
+      </div>
+      <div class="detail-body" id="detail-body">
+        <div class="empty-state"><div>Click a question on the left to see details.</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+let DATA = null;
+let currentFilter = 'all';
+let currentQAIndex = -1;   // index into DATA.qa_pairs
+let currentDetailTab = 'qa';
+let subgraphOnlyMode = false;
+let labelsVisible = true;
+let simulation = null;
+let currentGraphNodes = [];
+let currentGraphLinks = [];
+
+const TOOL_COLORS = {
+  'search+visit': '#f97316', search: '#f59e0b', wikipedia: '#8b5cf6',
+  scholar: '#10b981', calculator: '#ef4444', unit_converter: '#06b6d4',
+  timeline: '#06b6d4', knowledge_base: '#ec4899', comparison: '#e879f9',
+  document_reader: '#14b8a6', python: '#ef4444', visit: '#a3e635',
+};
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+async function loadData() {
+  const resp = await fetch('../data/output/ui_data.json');
+  DATA = await resp.json();
+  updateCounts();
+  renderQAList();
+  // Auto-select first item
+  const visible = filteredPairs();
+  if (visible.length) selectQA(visible[0]._origIndex);
+}
+
+function filteredPairs() {
+  return DATA.qa_pairs
+    .map((qa, i) => ({ ...qa, _origIndex: i }))
+    .filter(qa => currentFilter === 'all' || qa.qc_verdict === currentFilter);
+}
+
+function updateCounts() {
+  const all = DATA.qa_pairs;
+  document.getElementById('cnt-all').textContent = all.length;
+  document.getElementById('total-badge').textContent = all.length + ' pairs';
+  ['PASS', 'TOO_EASY', 'TOO_HARD'].forEach(v => {
+    document.getElementById('cnt-' + v).textContent =
+      all.filter(q => q.qc_verdict === v).length;
+  });
+}
+
+// ── Filter ───────────────────────────────────────────────────────────────────
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll('.filter-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.filter === f);
+  });
+  renderQAList();
+  const visible = filteredPairs();
+  if (visible.length) selectQA(visible[0]._origIndex);
+  else {
+    currentQAIndex = -1;
+    document.getElementById('graph-empty').style.display = 'flex';
+    document.getElementById('graph-toolbar').style.display = 'none';
+    document.getElementById('graph-stats').style.display = 'none';
+    d3.select('#graph-container svg').remove();
+    document.getElementById('detail-tabs').style.display = 'none';
+    document.getElementById('detail-body').innerHTML =
+      '<div class="empty-state"><div>No questions match this filter.</div></div>';
+  }
+}
+
+// ── QA List ──────────────────────────────────────────────────────────────────
+function renderQAList() {
+  const panel = document.getElementById('qa-panel');
+  panel.innerHTML = '';
+  filteredPairs().forEach(qa => {
+    const verdictBadge = verdictTag(qa.qc_verdict);
+    const uncOps = (qa.escalation_history || []).filter(h => h.startsWith('uncertainty:'));
+    const strategy = qa.metadata?.strategy;
+    const cx = qa.metadata?.complexity_level;
+    const metaBadges = [
+      complexityTag(cx),
+      ...uncOps.map(o => `<span class="badge-unc">${o.replace('uncertainty:','')}</span>`),
+      strategy ? `<span class="badge-strat">${strategy}</span>` : '',
+    ].join(' ');
+
+    const card = document.createElement('div');
+    card.className = 'qa-card' + (qa._origIndex === currentQAIndex ? ' active' : '');
+    card.dataset.index = qa._origIndex;
+    card.innerHTML = `
+      <div class="qa-meta">
+        <span style="color:#4b5563">#${qa._origIndex + 1}</span>
+        ${verdictBadge}
+        ${metaBadges}
+      </div>
+      <div class="qa-question">${qa.question}</div>
+      <div class="qa-answer-preview">${trunc(qa.answer, 110)}</div>
+    `;
+    card.onclick = () => selectQA(qa._origIndex);
+    panel.appendChild(card);
+  });
+}
+
+function verdictTag(v) {
+  if (!v) return '';
+  if (v === 'PASS')     return '<span class="badge-pass">✓ PASS</span>';
+  if (v === 'TOO_EASY') return '<span class="badge-easy">Too Easy</span>';
+  if (v === 'TOO_HARD') return '<span class="badge-hard">Too Hard</span>';
+  return `<span class="badge-unc">${v}</span>`;
+}
+
+function complexityTag(cx) {
+  if (cx === null || cx === undefined) return '';
+  const v = parseFloat(cx);
+  // Color: green (low) → yellow (mid) → red (high)
+  const r = Math.round(v * 220);
+  const g = Math.round((1 - v) * 180 + 60);
+  const color = `rgb(${r},${g},60)`;
+  const bg = `rgba(${r},${g},60,0.12)`;
+  const border = `rgba(${r},${g},60,0.3)`;
+  return `<span class="badge-cx" style="color:${color};background:${bg};border:1px solid ${border}">cx ${v.toFixed(2)}</span>`;
+}
+
+function trunc(s, n) { return s && s.length > n ? s.substring(0, n) + '…' : (s || ''); }
+
+// ── Select QA ────────────────────────────────────────────────────────────────
+function selectQA(index) {
+  currentQAIndex = index;
+  document.querySelectorAll('.qa-card').forEach(c => {
+    c.classList.toggle('active', parseInt(c.dataset.index) === index);
+  });
+  const qa = DATA.qa_pairs[index];
+  subgraphOnlyMode = false;
+  document.getElementById('btn-subgraph').classList.remove('active');
+  renderGraph(qa);
+  renderDetail(qa);
+}
+
+// ── Detail Panel ─────────────────────────────────────────────────────────────
+function setDetailTab(tab) {
+  currentDetailTab = tab;
+  document.querySelectorAll('.detail-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.tab === tab);
+  });
+  if (currentQAIndex >= 0) renderDetail(DATA.qa_pairs[currentQAIndex]);
+}
+
+function renderDetail(qa) {
+  document.getElementById('detail-tabs').style.display = 'flex';
+
+  if (currentDetailTab === 'qa') renderDetailQA(qa);
+  else if (currentDetailTab === 'solvers') renderDetailSolvers(qa);
+  else renderDetailChain(qa);
+}
+
+function renderDetailQA(qa) {
+  const body = document.getElementById('detail-body');
+  const cx = qa.metadata?.complexity_level;
+  const entities = (qa.metadata?.entities_incorporated || qa.metadata?.entities_required || []);
+  const chips = entities.map(e => `<span style="background:#1e2744;color:#93c5fd;padding:2px 9px;border-radius:10px;font-size:11px;border:1px solid #2a4a8a;margin:2px 3px 2px 0;display:inline-block">${e}</span>`).join('');
+  const verdict = qa.qc_verdict;
+  const verdictDesc = verdict === 'TOO_EASY'
+    ? 'Base solver answered correctly without tools — question is not challenging enough.'
+    : verdict === 'TOO_HARD'
+    ? 'Advanced solver with tools still could not answer correctly — question may be unanswerable or requires unavailable information.'
+    : verdict === 'PASS'
+    ? 'Base solver failed, advanced solver with tools succeeded, and question is unique.'
+    : '';
+
+  body.innerHTML = `
+    <div class="detail-grid2">
+      <div class="d-section">
+        <div class="d-label">Question</div>
+        <div class="d-val">${qa.question}</div>
+      </div>
+      <div class="d-section">
+        <div class="d-label">Reference Answer</div>
+        <div class="d-val answer-ref">${qa.answer}</div>
+      </div>
+    </div>
+    ${entities.length ? `
+    <div class="d-section" style="margin-top:12px">
+      <div class="d-label">Entities incorporated by graph escalation</div>
+      <div style="margin-top:4px">${chips}</div>
+    </div>` : ''}
+    ${verdictDesc ? `
+    <div class="d-section" style="margin-top:12px">
+      <div class="d-label">QC Verdict — ${verdict}</div>
+      <div class="d-val" style="font-size:12px;color:#9ca3af">${verdictDesc}</div>
+    </div>` : ''}
+    ${cx !== null && cx !== undefined ? `
+    <div class="d-section" style="margin-top:12px">
+      <div class="d-label">Complexity level</div>
+      <div class="d-val" style="display:flex;align-items:center;gap:10px">
+        ${complexityTag(cx)}
+        <span style="font-size:12px;color:#6b7280">walk depth ${Math.round(2 + cx*4)}–${Math.round(4 + cx*8)} · strategy weights ${cx >= 0.6 ? 'bridging-heavy' : cx >= 0.3 ? 'balanced' : 'hop-heavy'}</span>
+      </div>
+    </div>` : ''}
+  `;
+}
+
+function renderDetailSolvers(qa) {
+  const body = document.getElementById('detail-body');
+  const base = qa.base_solver_answer || '—';
+  const adv  = qa.advanced_solver_answer || '—';
+  const verdict = qa.qc_verdict;
+
+  const baseCorrect = verdict === 'TOO_EASY';
+  const advCorrect  = verdict === 'PASS';
+
+  body.innerHTML = `
+    <div class="detail-grid3">
+      <div class="d-section">
+        <div class="d-label">Reference Answer</div>
+        <div class="d-val answer-ref">${qa.answer}</div>
+      </div>
+      <div class="d-section">
+        <div class="d-label">Base Solver <span style="color:#6b7280;font-weight:400">(no tools)</span>
+          &nbsp;${baseCorrect ? '<span class="badge-pass">✓ correct</span>' : '<span class="badge-hard">✗ wrong</span>'}</div>
+        <div class="d-val answer-base">${base}</div>
+      </div>
+      <div class="d-section">
+        <div class="d-label">Advanced Solver <span style="color:#6b7280;font-weight:400">(ReAct + tools)</span>
+          &nbsp;${advCorrect ? '<span class="badge-pass">✓ correct</span>' : adv === '—' ? '' : '<span class="badge-hard">✗ wrong</span>'}</div>
+        <div class="d-val answer-adv">${adv}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderDetailChain(qa) {
+  const body = document.getElementById('detail-body');
+  const history = qa.escalation_history || [];
+
+  // Reconstruct chain steps
+  // history is a mix of: "uncertainty:op_name" strings and previous question strings
+  // The last non-op string is the pre-graph-escalation question
+  // The current qa.question is the final question after graph escalation
+  const steps = [];
+
+  const prevQuestion = history.filter(h => !h.startsWith('uncertainty:')).slice(-1)[0];
+  const uncOps = history.filter(h => h.startsWith('uncertainty:'));
+  const strategy = qa.metadata?.strategy;
+  const entitiesAdded = qa.metadata?.entities_incorporated || [];
+
+  if (prevQuestion && uncOps.length === 0) {
+    // Only graph escalation happened
+    steps.push({ type: 'question', label: 'Before graph escalation', text: prevQuestion });
+    steps.push({ type: 'op', label: strategy || 'graph_escalation', sub: entitiesAdded.join(', '), cls: 'badge-strat' });
+    steps.push({ type: 'question', label: 'Final question', text: qa.question, current: true });
+  } else if (prevQuestion && uncOps.length > 0) {
+    // Both uncertainty and graph escalation
+    // prevQuestion here is the uncertainty-injected version
+    steps.push({ type: 'op', label: uncOps[0].replace('uncertainty:', ''), sub: 'uncertainty injection', cls: 'badge-unc' });
+    steps.push({ type: 'question', label: 'After uncertainty injection', text: prevQuestion });
+    steps.push({ type: 'op', label: strategy || 'graph_escalation', sub: entitiesAdded.join(', '), cls: 'badge-strat' });
+    steps.push({ type: 'question', label: 'Final question', text: qa.question, current: true });
+  } else {
+    // No prior history stored — show just the final
+    steps.push({ type: 'question', label: 'Final question (no prior history)', text: qa.question, current: true });
+  }
+
+  let html = '<div class="chain">';
+  steps.forEach((s, i) => {
+    if (s.type === 'question') {
+      html += `<div class="chain-step${s.current ? ' current' : ''}">
+        <div style="font-size:10px;color:#6b7280;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px">${s.label}</div>
+        <div>${s.text}</div>
+      </div>`;
+    } else {
+      html += `<div class="chain-op">
+        <div style="color:#4b5563;font-size:20px;line-height:1">→</div>
+        <span class="chain-op-badge ${s.cls}">${s.label}</span>
+        ${s.sub ? `<span style="font-size:10px;color:#6b7280;max-width:100px;text-align:center;word-break:break-word">${s.sub}</span>` : ''}
+      </div>`;
+    }
+  });
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+// ── Graph rendering ───────────────────────────────────────────────────────────
+function toggleSubgraphOnly() {
+  subgraphOnlyMode = !subgraphOnlyMode;
+  document.getElementById('btn-subgraph').classList.toggle('active', subgraphOnlyMode);
+  if (currentQAIndex >= 0) renderGraph(DATA.qa_pairs[currentQAIndex]);
+}
+
+function toggleLabels() {
+  labelsVisible = !labelsVisible;
+  const btn = document.getElementById('btn-labels');
+  btn.textContent = labelsVisible ? 'Hide labels' : 'Show labels';
+  d3.selectAll('.node-label').attr('display', labelsVisible ? null : 'none');
+}
+
+function renderGraph(qa) {
+  document.getElementById('graph-empty').style.display = 'none';
+  document.getElementById('graph-toolbar').style.display = 'flex';
+  document.getElementById('graph-stats').style.display = 'block';
+  document.getElementById('node-card').style.display = 'none';
+
+  const container = document.getElementById('graph-container');
+  d3.select('#graph-container svg').remove();
+
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+
+  const svg = d3.select('#graph-container')
+    .append('svg')
+    .attr('width', width)
+    .attr('height', height);
+
+  const g = svg.append('g');
+  const zoom = d3.zoom().scaleExtent([0.1, 6])
+    .on('zoom', e => { g.attr('transform', e.transform); hideNodeCard(); });
+  svg.call(zoom);
+  svg.on('click', () => hideNodeCard());
+
+  const kg = DATA.knowledge_graph;
+  const subgraphIds = new Set(qa.subgraph_entity_ids || qa.source_chunk_ids || []);
+
+  let entities = kg.entities;
+  if (subgraphOnlyMode) entities = entities.filter(e => subgraphIds.has(e.id));
+  const nodeIdSet = new Set(entities.map(e => e.id));
+
+  let relations = kg.relations.filter(r => nodeIdSet.has(r.source_id) && nodeIdSet.has(r.target_id));
+
+  const nodes = entities.map(e => ({
+    id: e.id, name: e.name, type: e.entity_type,
+    toolSource: e.tool_source || '',
+    toolQuery: e.tool_query || '',
+    factValue: e.attributes?.value || e.snippet || '',
+    keyTerms: e.attributes?.key_terms || [],
+    inSubgraph: subgraphIds.has(e.id),
+  }));
+
+  const links = relations.map(r => ({
+    source: r.source_id, target: r.target_id,
+    type: r.relation_type,
+    inSubgraph: subgraphIds.has(r.source_id) && subgraphIds.has(r.target_id),
+  }));
+
+  currentGraphNodes = nodes;
+  currentGraphLinks = links;
+
+  // Graph stats
+  const nSub = nodes.filter(n => n.inSubgraph).length;
+  const eSub = links.filter(l => l.inSubgraph).length;
+  document.getElementById('graph-stats').innerHTML = `
+    <div class="stat-row"><div class="dot" style="background:#3b82f6"></div> ${nSub} subgraph nodes / ${eSub} edges</div>
+    <div class="stat-row" style="margin-top:4px"><div class="dot" style="background:#4b5563"></div> ${nodes.length - nSub} other nodes</div>
+    <div style="margin-top:8px;font-size:10px;color:#6b7280">Tool source colors:</div>
+    ${Object.entries(TOOL_COLORS).slice(0,5).map(([t,c]) =>
+      `<div class="stat-row" style="margin-top:3px"><div class="dot" style="background:${c}"></div> ${t}</div>`
+    ).join('')}
+    <div style="margin-top:6px;font-size:10px;color:#4b5563">scroll to zoom · drag to pan · click node for details</div>
+  `;
+
+  if (simulation) simulation.stop();
+
+  // Arrow markers
+  const defs = g.append('defs');
+  [['arr-sub','#3b82f6'],['arr-dim','#374151']].forEach(([id, col]) => {
+    defs.append('marker').attr('id', id)
+      .attr('viewBox','0 -4 8 8').attr('refX',22).attr('refY',0)
+      .attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
+      .append('path').attr('fill', col).attr('d','M0,-4L8,0L0,4');
+  });
+
+  // Links
+  const link = g.append('g').selectAll('line').data(links).join('line')
+    .attr('stroke', d => d.inSubgraph ? '#3b82f688' : '#1f2937')
+    .attr('stroke-width', d => d.inSubgraph ? 1.8 : 1)
+    .attr('marker-end', d => `url(#${d.inSubgraph ? 'arr-sub' : 'arr-dim'})`);
+
+  const linkLabel = g.append('g').selectAll('text').data(links.filter(l => l.inSubgraph)).join('text')
+    .attr('text-anchor','middle').attr('font-size','9px').attr('fill','#60a5fa88')
+    .text(d => d.type);
+
+  // Nodes
+  const node = g.append('g').selectAll('g').data(nodes).join('g')
+    .attr('class', 'node-g')
+    .style('cursor','pointer')
+    .call(d3.drag()
+      .on('start', (e,d) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+      .on('drag',  (e,d) => { d.fx=e.x; d.fy=e.y; })
+      .on('end',   (e,d) => { if (!e.active) simulation.alphaTarget(0); d.fx=null; d.fy=null; }))
+    .on('click', (e, d) => { e.stopPropagation(); showNodeCard(e, d); });
+
+  node.append('circle')
+    .attr('r', d => d.inSubgraph ? 13 : 7)
+    .attr('fill', d => d.inSubgraph ? (TOOL_COLORS[d.toolSource] || '#3b82f6') : '#1f2937')
+    .attr('stroke', d => d.inSubgraph ? '#e5e7eb' : '#374151')
+    .attr('stroke-width', d => d.inSubgraph ? 1.5 : 1)
+    .attr('fill-opacity', d => d.inSubgraph ? 1.0 : 0.5);
+
+  node.append('text')
+    .attr('class','node-label')
+    .attr('dx', d => d.inSubgraph ? 16 : 10)
+    .attr('dy', 4)
+    .attr('font-size', d => d.inSubgraph ? '11px' : '9px')
+    .attr('font-weight', d => d.inSubgraph ? '600' : '400')
+    .attr('fill', d => d.inSubgraph ? '#e5e7eb' : '#4b5563')
+    .attr('display', labelsVisible ? null : 'none')
+    .text(d => d.name);
+
+  simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(d => d.inSubgraph ? 90 : 120))
+    .force('charge', d3.forceManyBody().strength(d => d.inSubgraph ? -400 : -150))
+    .force('center', d3.forceCenter(width/2, height/2))
+    .force('collision', d3.forceCollide().radius(d => d.inSubgraph ? 30 : 18));
+
+  simulation.on('tick', () => {
+    link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
+        .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+    linkLabel.attr('x',d=>(d.source.x+d.target.x)/2)
+             .attr('y',d=>(d.source.y+d.target.y)/2-5);
+    node.attr('transform', d=>`translate(${d.x},${d.y})`);
+  });
+
+  // After settling, zoom to fit subgraph nodes
+  simulation.on('end', () => zoomToSubgraph(svg, g, zoom, nodes, width, height));
+}
+
+function zoomToSubgraph(svg, g, zoom, nodes, W, H) {
+  const sub = nodes.filter(n => n.inSubgraph && n.x != null);
+  if (!sub.length) return;
+  const xs = sub.map(n=>n.x), ys = sub.map(n=>n.y);
+  const x0=Math.min(...xs)-60, x1=Math.max(...xs)+60;
+  const y0=Math.min(...ys)-60, y1=Math.max(...ys)+60;
+  const scale = Math.min(0.95, 0.85 * Math.min(W/(x1-x0), H/(y1-y0)));
+  const tx = W/2 - scale*(x0+x1)/2;
+  const ty = H/2 - scale*(y0+y1)/2;
+  svg.transition().duration(600)
+    .call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+}
+
+// ── Node card (click popup) ────────────────────────────────────────────────
+function showNodeCard(event, d) {
+  const card = document.getElementById('node-card');
+  const toolColor = TOOL_COLORS[d.toolSource] || '#9ca3af';
+  card.innerHTML = `
+    <div class="nc-name" style="color:${toolColor}">${d.name}</div>
+    <div class="nc-row"><span style="color:#6b7280">Type:</span> ${d.type}</div>
+    ${d.toolSource ? `<div class="nc-row"><span style="color:#6b7280">Tool:</span> ${d.toolSource} — "${d.toolQuery}"</div>` : ''}
+    ${d.keyTerms.length ? `<div class="nc-row"><span style="color:#6b7280">Key terms:</span> ${d.keyTerms.join(', ')}</div>` : ''}
+    ${d.factValue ? `<div class="nc-value">${d.factValue}</div>` : ''}
+  `;
+  // Position near cursor but keep within viewport
+  const cRect = document.getElementById('graph-container').getBoundingClientRect();
+  let x = event.clientX - cRect.left + 16;
+  let y = event.clientY - cRect.top + 16;
+  card.style.display = 'block';
+  const cw = card.offsetWidth;
+  if (x + cw > cRect.width - 10) x = event.clientX - cRect.left - cw - 10;
+  card.style.left = x + 'px';
+  card.style.top  = y + 'px';
+}
+
+function hideNodeCard() {
+  document.getElementById('node-card').style.display = 'none';
+}
+
+// ── Generate panel ───────────────────────────────────────────────────────────
+let _pollTimer = null;
+let _jobWasRunning = false;
+
+function toggleGeneratePanel() {
+  const bar = document.getElementById('generate-bar');
+  const tab = document.getElementById('gen-tab');
+  const shown = bar.style.display !== 'none';
+  bar.style.display = shown ? 'none' : 'block';
+  tab.classList.toggle('active', !shown);
+}
+
+function onComplexityChange() {
+  const v = parseFloat(document.getElementById('gen-complexity').value);
+  document.getElementById('gen-complexity-val').textContent = v.toFixed(2);
+}
+
+function onOriginalChange() {
+  const orig = document.getElementById('gen-original').checked;
+  const slider = document.getElementById('gen-complexity');
+  const val = document.getElementById('gen-complexity-val');
+  slider.disabled = orig;
+  val.style.opacity = orig ? '0.3' : '1';
+  val.textContent = orig ? '—' : parseFloat(slider.value).toFixed(2);
+}
+
+async function startGeneration() {
+  const original  = document.getElementById('gen-original').checked;
+  const complexity = original ? null : parseFloat(document.getElementById('gen-complexity').value);
+  const batches   = parseInt(document.getElementById('gen-batches').value, 10);
+  const batchSize = parseInt(document.getElementById('gen-batch-size').value, 10);
+  const apiKey    = document.getElementById('gen-api-key').value.trim();
+
+  const btn = document.getElementById('gen-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+
+  try {
+    const resp = await fetch('/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ complexity, batches, batch_size: batchSize, api_key: apiKey || undefined }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      alert(data.error);
+      btn.disabled = false;
+      btn.textContent = 'Generate';
+      return;
+    }
+    document.getElementById('gen-status-area').style.display = 'block';
+    document.getElementById('gen-log-box').innerHTML = '';
+    _jobWasRunning = true;
+    startPolling();
+  } catch (e) {
+    alert('Could not reach server: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Generate';
+  }
+}
+
+function startPolling() {
+  if (_pollTimer) clearInterval(_pollTimer);
+  _pollTimer = setInterval(pollStatus, 2500);
+  pollStatus();
+}
+
+async function pollStatus() {
+  try {
+    const resp = await fetch('/api/status');
+    const data = await resp.json();
+    renderJobStatus(data);
+
+    if (_jobWasRunning && !data.running) {
+      clearInterval(_pollTimer);
+      _pollTimer = null;
+      _jobWasRunning = false;
+      document.getElementById('gen-btn').disabled = false;
+      document.getElementById('gen-btn').textContent = 'Generate';
+      // Reload QA data after 1 s to let file writes flush
+      setTimeout(() => loadData(), 1200);
+    }
+  } catch (_) { /* server may momentarily be busy */ }
+}
+
+function renderJobStatus(data) {
+  const statusEl = document.getElementById('gen-status-text');
+  const logBox   = document.getElementById('gen-log-box');
+
+  if (data.running) {
+    const cStr = data.complexity !== null && data.complexity !== undefined
+      ? `complexity ${parseFloat(data.complexity).toFixed(2)}`
+      : 'original pipeline';
+    const eStr = data.elapsed_s ? ` · ${data.elapsed_s}s elapsed` : '';
+    statusEl.innerHTML = `<span style="color:#fbbf24">Running</span> — ${cStr}${eStr}`;
+    document.getElementById('gen-btn').disabled = true;
+    document.getElementById('gen-btn').textContent = 'Running…';
+  } else if (!_jobWasRunning) {
+    statusEl.innerHTML = `<span style="color:#6ee7b7">Done</span> — data reloaded`;
+  }
+
+  const lines = data.log_tail || [];
+  logBox.innerHTML = lines.map(l => {
+    const cls = (l.includes('★') || l.includes('PASS')) ? 'gen-log-pass'
+              : l.includes('ERROR') ? 'gen-log-err' : '';
+    return `<div class="${cls}">${escHtml(l)}</div>`;
+  }).join('');
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+loadData();
+</script>
+</body>
+</html>

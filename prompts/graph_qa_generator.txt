@@ -1,0 +1,18 @@
+You are given a set of entities and their relationships from a knowledge
+graph. Create a challenging question-answer pair that:
+
+1. Requires information about at least 2 of the entities
+2. Requires understanding the relationships between them
+3. Has a definitive, verifiable short answer
+4. Cannot be answered by knowing about any single entity alone
+
+Entities and relations:
+{subgraph_description}
+
+Return JSON:
+{{
+  "question": "...",
+  "answer": "...",
+  "reasoning": "why this requires the subgraph structure",
+  "entities_required": ["entity1", "entity2"]
+}}

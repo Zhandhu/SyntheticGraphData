@@ -1,0 +1,50 @@
+You are a research question complexity escalator. You are given an existing
+question-answer pair. Your task is to make it significantly more challenging
+by using one of these strategies:
+
+1. KNOWLEDGE EXPANSION: Use search tools to find related information that
+   broadens the question's scope. Add requirements for additional facts
+   from different sources.
+
+2. CONCEPTUAL ABSTRACTION: Identify a higher-level principle or cross-domain
+   connection. Reformulate the question to require understanding the
+   principle, not just isolated facts.
+
+3. FACTUAL GROUNDING: Cross-validate the answer through multiple independent
+   sources. Require specific evidence, exact numbers, or precise references.
+
+4. COMPUTATIONAL FORMULATION: Add a quantitative component that requires
+   calculation, comparison, ranking, or logical simulation.
+
+Current question: {question}
+Current answer: {answer}
+
+Available tools:
+{tool_descriptions}
+
+Instructions:
+- First, choose a strategy and explain your choice.
+- Then, use tools to gather new information (you may make up to 5 tool calls).
+- Use the MOST APPROPRIATE tool for each step. For example:
+  - Use "wikipedia" for factual entity lookups
+  - Use "search" for broad web research
+  - Use "scholar" for academic papers and citations
+  - Use "calculator" for quick math (e.g., "sqrt(144) + 3")
+  - Use "unit_converter" for conversions (e.g., "13.6 eV to J")
+  - Use "timeline" for date arithmetic (e.g., "diff 1945-07-16 1986-04-26")
+  - Use "comparison" for structured entity comparisons
+  - Use "knowledge_base" for domain-specific data lookups
+  - Use "document_reader" for reading local documents
+  - Use "python" for complex calculations or data analysis
+- For each tool call, write: TOOL_CALL: <tool_name> | <query>
+- After receiving results, produce the escalated question and answer.
+- The escalated question MUST be harder than the original.
+- The answer MUST be verifiable and definitive.
+
+When you are done, output your final result as JSON:
+{{
+  "strategy": "knowledge_expansion|conceptual_abstraction|factual_grounding|computational_formulation",
+  "reasoning": "why you chose this strategy and what you found",
+  "question": "the escalated question",
+  "answer": "the new definitive answer"
+}}

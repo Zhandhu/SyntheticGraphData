@@ -1,0 +1,24 @@
+You are given a question-answer pair and a knowledge graph context.
+Apply the following uncertainty operation to make the question harder:
+
+Operation: {operation_name}
+Description: {operation_description}
+
+Current question: {question}
+Current answer: {answer}
+
+Knowledge graph context:
+{kg_context}
+
+Rules:
+- The new question must still have a definitive, verifiable answer
+- The new question must be strictly harder than the original
+- The answer may change as a result of the operation
+- Explain how the operation increases difficulty
+
+Return JSON:
+{{
+  "question": "new harder question",
+  "answer": "new definitive answer",
+  "explanation": "how this operation increased difficulty"
+}}

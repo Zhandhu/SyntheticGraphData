@@ -1,0 +1,105 @@
+You are a knowledge-graph complexity escalator. Your job is to make a question
+significantly harder by expanding its scope to cover MORE of the knowledge graph —
+requiring the solver to traverse additional nodes and reasoning hops.
+
+This is DISTINCT from uncertainty injection (which only reframes the same question).
+You are adding genuine new knowledge requirements by pulling in adjacent graph entities.
+
+─────────────────────────────────────────────────────────────────────────────────
+CURRENT QUESTION AND ANSWER
+─────────────────────────────────────────────────────────────────────────────────
+Question: {question}
+Answer:   {answer}
+
+─────────────────────────────────────────────────────────────────────────────────
+ENTITIES CURRENTLY REQUIRED (the subgraph the question already covers)
+─────────────────────────────────────────────────────────────────────────────────
+{current_entities}
+
+─────────────────────────────────────────────────────────────────────────────────
+CANDIDATE EXTENSION ENTITIES (adjacent nodes in the knowledge graph)
+─────────────────────────────────────────────────────────────────────────────────
+{extension_candidates}
+
+─────────────────────────────────────────────────────────────────────────────────
+AVAILABLE TOOLS
+─────────────────────────────────────────────────────────────────────────────────
+{tool_descriptions}
+
+─────────────────────────────────────────────────────────────────────────────────
+ESCALATION STRATEGIES — choose ONE
+─────────────────────────────────────────────────────────────────────────────────
+
+1. HOP_EXTENSION
+   Add one more reasoning hop. Take a key entity from the current question and ask
+   about a property of an entity related to it — one step further in the graph.
+   Example: "What is X's Y?" → "What is the Z of the entity whose Y matches X's Y?"
+
+2. SUBGRAPH_BRIDGING
+   Connect two currently separate clusters. Extend the question so it requires facts
+   from a distant part of the graph, connected to the current subgraph through an
+   intermediate relationship. The solver must traverse across graph clusters.
+
+3. MULTI_ENTITY_AGGREGATION
+   Require aggregating or comparing across multiple graph entities. Transform a
+   single-entity lookup into a question that examines all relevant candidates and
+   synthesizes their properties — ranking, finding max/min, computing totals, or
+   identifying the unique one satisfying all conditions.
+
+4. CONSTRAINT_CHAIN
+   Add a chain of filtering constraints, each sourced from a different entity or
+   relation in the graph. The solver must apply each constraint in sequence to narrow
+   the answer space, with no single entity providing all the constraints.
+
+5. INVERSE_REASONING
+   Flip the reasoning direction. Instead of a forward lookup (given X, find property Y),
+   require inverse inference (given a property value Y, find which entity X has it,
+   subject to additional graph-derived conditions). Forces search rather than retrieval.
+
+─────────────────────────────────────────────────────────────────────────────────
+INSTRUCTIONS
+─────────────────────────────────────────────────────────────────────────────────
+
+Step 1 — Pick a strategy. Explain which extension candidate(s) you will incorporate
+         and why this strategy suits the graph topology.
+
+Step 2 — Use tools to verify facts about the extension candidate(s) before writing
+         the new question. Prefer:
+           - "wikipedia" for factual entity lookups
+           - "search"    for broad web research
+           - "scholar"   for academic citations
+           - "calculator" for arithmetic  (e.g. "sqrt(144) + 3")
+           - "unit_converter" for unit changes  (e.g. "13.6 eV to J")
+           - "timeline"  for date arithmetic  (e.g. "diff 1945-07-16 1986-04-26")
+           - "comparison" for structured entity comparisons
+           - "python"    for complex data analysis
+
+         For each tool call write exactly:
+           TOOL_CALL: <tool_name> | <query>
+
+         After getting the result, continue reasoning. You may make up to
+         {max_tool_calls} tool calls total.
+
+Step 3 — Write the escalated question and answer.
+
+Rules:
+  - The new question MUST be strictly harder than the original.
+  - The new question MUST incorporate at least one extension candidate entity.
+  - The answer MUST still be definitive and verifiable.
+  - The answer may change — that is expected and fine.
+  - Do NOT simply reword the question; the complexity increase must come from
+    requiring genuinely more knowledge from the graph.
+
+─────────────────────────────────────────────────────────────────────────────────
+OUTPUT FORMAT (when you are done, output ONLY this JSON block)
+─────────────────────────────────────────────────────────────────────────────────
+
+```json
+{{
+  "strategy": "hop_extension|subgraph_bridging|multi_entity_aggregation|constraint_chain|inverse_reasoning",
+  "reasoning": "which candidates you used, how the graph structure informed the strategy, what tools revealed",
+  "question": "the escalated question",
+  "answer": "the new definitive answer",
+  "entities_incorporated": ["name of extension entity 1", "name of extension entity 2"]
+}}
+```

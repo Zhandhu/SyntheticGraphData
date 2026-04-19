@@ -1,0 +1,28 @@
+{
+  "science": [
+    "CRISPR-Cas9", "gravitational waves", "mRNA vaccines",
+    "quantum supremacy", "AlphaFold", "dark energy",
+    "topological insulators", "LIGO", "James Webb Space Telescope",
+    "graphene", "Higgs boson", "CERN"
+  ],
+  "history": [
+    "Treaty of Westphalia", "Silk Road", "Manhattan Project",
+    "Bretton Woods", "Berlin Conference 1884", "Meiji Restoration",
+    "Congress of Vienna", "Scramble for Africa", "Marshall Plan"
+  ],
+  "economics": [
+    "quantitative easing", "Gini coefficient", "Phillips curve",
+    "Basel III", "special drawing rights", "Dutch disease",
+    "Bretton Woods system", "Black-Scholes model"
+  ],
+  "technology": [
+    "transformer architecture", "RISC-V", "solid-state batteries",
+    "federated learning", "homomorphic encryption", "neuromorphic computing",
+    "WebAssembly", "LoRA fine-tuning"
+  ],
+  "geopolitics": [
+    "South China Sea disputes", "Arctic Council", "BRICS expansion",
+    "semiconductor export controls", "rare earth supply chains",
+    "Belt and Road Initiative", "AUKUS"
+  ]
+}

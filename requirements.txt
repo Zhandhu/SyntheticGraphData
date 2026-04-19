@@ -1,0 +1,14 @@
+pydantic>=2.0
+pyyaml
+numpy
+scipy
+networkx
+requests
+beautifulsoup4
+sentence-transformers
+tiktoken
+httpx
+duckduckgo-search
+pdfplumber
+anthropic>=0.30
+openai>=1.0
